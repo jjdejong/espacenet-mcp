@@ -315,6 +315,24 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["publication_number"]
             }
+        ),
+        Tool(
+            name="find_text_in_patent",
+            description="Search for quoted text in a patent's description and identify the paragraph number. Useful when examiner cites column/line numbers with a quote.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "publication_number": {
+                        "type": "string",
+                        "description": "Patent publication number"
+                    },
+                    "search_text": {
+                        "type": "string",
+                        "description": "Text excerpt to find in the patent description (e.g., text quoted by examiner)"
+                    }
+                },
+                "required": ["publication_number", "search_text"]
+            }
         )
     ]
 
@@ -377,6 +395,66 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return [TextContent(
                     type="text",
                     text=f"Images information for {pub_num}:\n\n{formatted_images}"
+                )]
+            
+            elif name == "find_text_in_patent":
+                search_text = arguments.get("search_text", "")
+                if not search_text:
+                    return [TextContent(
+                        type="text",
+                        text="Error: search_text is required"
+                    )]
+                
+                # Get description
+                description_xml = await fetch_description(client, pub_info)
+                parsed = parse_description_xml(description_xml)
+                
+                # Search for text in paragraphs
+                search_normalized = " ".join(search_text.lower().split())
+                matches = []
+                
+                for section in parsed.get("sections", []):
+                    for i, para in enumerate(section.get("paragraphs", [])):
+                        para_normalized = " ".join(para.lower().split())
+                        if search_normalized in para_normalized:
+                            # Try to extract paragraph number from original text
+                            # (paragraph numbers are often in the heading or structure)
+                            matches.append({
+                                "section": section.get("heading", "Unknown section"),
+                                "paragraph_index": i,
+                                "text": para,
+                                "context_before": section["paragraphs"][i-1] if i > 0 else None,
+                                "context_after": section["paragraphs"][i+1] if i < len(section["paragraphs"])-1 else None
+                            })
+                
+                if not matches:
+                    return [TextContent(
+                        type="text",
+                        text=f"Text not found in {pub_num}.\n\nSearched for: {search_text}\n\nThe quoted text may be in the claims instead of the description, or may be paraphrased differently in the XML version."
+                    )]
+                
+                # Format results
+                output = [f"Found {len(matches)} match(es) in {pub_num}:\n"]
+                for idx, match in enumerate(matches, 1):
+                    output.append(f"\nMatch {idx}:")
+                    output.append(f"Section: {match['section']}")
+                    output.append(f"Paragraph index in section: {match['paragraph_index']}")
+                    output.append(f"\nMatching text:")
+                    output.append(match['text'])
+                    
+                    if match['context_before']:
+                        output.append(f"\nPrevious paragraph:")
+                        output.append(match['context_before'])
+                    
+                    if match['context_after']:
+                        output.append(f"\nNext paragraph:")
+                        output.append(match['context_after'])
+                    
+                    output.append("\n" + "="*80)
+                
+                return [TextContent(
+                    type="text",
+                    text="\n".join(output)
                 )]
             
             elif name == "get_full_patent_data":
