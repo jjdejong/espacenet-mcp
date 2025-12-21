@@ -64,8 +64,8 @@ def parse_publication_number(pub_num: str) -> dict[str, str]:
     - WO2020/123456A1
     - EP 1234567 A1
     """
-    # Remove spaces and normalize
-    pub_num = pub_num.replace(" ", "").replace("/", "").upper()
+    # Remove spaces, hyphens, slashes and normalize
+    pub_num = pub_num.replace(" ", "").replace("/", "").replace("-", "").upper()
     
     # Pattern: CC + number + optional kind code
     # Country code: 2 letters, Number: digits, Kind: 1-2 alphanumeric
