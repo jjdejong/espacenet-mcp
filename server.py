@@ -9,11 +9,11 @@ The server handles publication numbers in various formats commonly cited in offi
 - EP1234567A1
 - US2020123456A1
 - WO2020/123456
+- US 2018/0189236 (with leading zero)
 - etc.
 """
 
 import asyncio
-import base64
 import os
 import re
 from typing import Any
@@ -22,13 +22,7 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import (
-    Resource,
-    TextContent,
-    ImageContent,
-    Tool,
-)
-from pydantic import AnyUrl
+from mcp.types import TextContent, Tool
 
 # Import XML parsing utilities
 from xml_parser import (
@@ -63,26 +57,25 @@ def parse_publication_number(pub_num: str) -> dict[str, str]:
     - US2020123456A1  
     - WO2020/123456A1
     - EP 1234567 A1
+    - US 2018/0189236 (with leading zero - will be removed for OPS, kept for Google Patents)
     """
     # Remove spaces, hyphens, slashes and normalize
-    pub_num = pub_num.replace(" ", "").replace("/", "").replace("-", "").upper()
+    pub_num_normalized = pub_num.replace(" ", "").replace("/", "").replace("-", "").upper()
     
     # Pattern: CC + number + optional kind code
     # Country code: 2 letters, Number: digits, Kind: 1-2 alphanumeric
     pattern = r'^([A-Z]{2})(\d+)([A-Z]\d?)?$'
-    match = re.match(pattern, pub_num)
+    match = re.match(pattern, pub_num_normalized)
     
     if not match:
         raise ValueError(f"Invalid publication number format: {pub_num}")
     
     country_code, number, kind_code = match.groups()
     
-    # Remove leading zeros from number for EPO format
-    number = str(int(number))
-    
     return {
         "country": country_code,
-        "doc_number": number,
+        "doc_number": str(int(number)),  # Remove leading zeros for EPO OPS
+        "doc_number_full": number,  # Keep leading zeros for Google Patents
         "kind": kind_code or "",
         "format": "epodoc"  # EPO document format
     }
@@ -206,36 +199,6 @@ async def fetch_images(
         if e.response.status_code == 404:
             return []  # No images available
         raise
-
-
-async def fetch_full_text_document(
-    client: httpx.AsyncClient, pub_info: dict[str, str], doc_format: str = "pdf"
-) -> bytes:
-    """Fetch full text document (PDF or TIFF) for a patent publication."""
-    token = await get_access_token(client)
-    
-    # Get document instance URL from images endpoint first
-    images_data = await fetch_images(client, pub_info)
-    
-    if not images_data or 'ops:world-patent-data' not in images_data:
-        raise ValueError("No document available for this publication")
-    
-    # Extract document reference
-    # This is a simplified version - actual implementation would parse the JSON structure
-    url = (
-        f"{OPS_BASE_URL}/published-data/publication/"
-        f"{pub_info['format']}/{pub_info['country']}.{pub_info['doc_number']}.{pub_info['kind']}/fulltext"
-    )
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/pdf" if doc_format == "pdf" else "image/tiff"
-    }
-    
-    response = await client.get(url, headers=headers)
-    response.raise_for_status()
-    
-    return response.content
 
 
 # Create MCP server instance
@@ -369,24 +332,50 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )]
             
             elif name == "get_patent_description":
-                description_xml = await fetch_description(client, pub_info)
-                # Parse and format description
-                parsed = parse_description_xml(description_xml)
-                formatted = format_description_for_display(parsed)
-                return [TextContent(
-                    type="text",
-                    text=formatted
-                )]
+                try:
+                    description_xml = await fetch_description(client, pub_info)
+                    # Parse and format description
+                    parsed = parse_description_xml(description_xml)
+                    formatted = format_description_for_display(parsed)
+                    return [TextContent(
+                        type="text",
+                        text=formatted
+                    )]
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        # Fallback to Google Patents (use doc_number_full with leading zeros)
+                        google_patents_url = f"https://patents.google.com/patent/{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}/en"
+                        return [TextContent(
+                            type="text",
+                            text=f"Description not available for {pub_num} via EPO OPS API.\n\n"
+                                 f"Try fetching from Google Patents.\n\n"
+                                 f"Please paste this into the chat:\n"
+                                 f"Fetch {google_patents_url}"
+                        )]
+                    raise
             
             elif name == "get_patent_claims":
-                claims_xml = await fetch_claims(client, pub_info)
-                # Parse and format claims
-                parsed = parse_claims_xml(claims_xml)
-                formatted = format_claims_for_display(parsed)
-                return [TextContent(
-                    type="text",
-                    text=formatted
-                )]
+                try:
+                    claims_xml = await fetch_claims(client, pub_info)
+                    # Parse and format claims
+                    parsed = parse_claims_xml(claims_xml)
+                    formatted = format_claims_for_display(parsed)
+                    return [TextContent(
+                        type="text",
+                        text=formatted
+                    )]
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        # Fallback to Google Patents (use doc_number_full with leading zeros)
+                        google_patents_url = f"https://patents.google.com/patent/{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}/en"
+                        return [TextContent(
+                            type="text",
+                            text=f"Claims not available for {pub_num} via EPO OPS API.\n\n"
+                                 f"Try fetching from Google Patents.\n\n"
+                                 f"Please paste this into the chat:\n"
+                                 f"Fetch {google_patents_url}"
+                        )]
+                    raise
             
             elif name == "get_patent_images":
                 images = await fetch_images(client, pub_info)
@@ -417,8 +406,6 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     for i, para in enumerate(section.get("paragraphs", [])):
                         para_normalized = " ".join(para.lower().split())
                         if search_normalized in para_normalized:
-                            # Try to extract paragraph number from original text
-                            # (paragraph numbers are often in the heading or structure)
                             matches.append({
                                 "section": section.get("heading", "Unknown section"),
                                 "paragraph_index": i,
