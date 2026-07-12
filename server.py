@@ -565,7 +565,6 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             
             elif name == "get_patent_images":
                 images = await fetch_images(client, pub_info)
-                import json
                 formatted_images = json.dumps(images, indent=2)
                 return [TextContent(
                     type="text",
@@ -655,7 +654,6 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 ]
                 
                 if images:
-                    import json
                     output_parts.extend([
                         "",
                         "Drawing Information:",
@@ -671,7 +669,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 raise ValueError(f"Unknown tool: {name}")
         
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
+            if name in {"search_patents", "search_cpc", "get_cpc_hierarchy"}:
+                return [TextContent(
+                    type="text",
+                    text=f"Error: {name} request failed: HTTP {e.response.status_code} - {e.response.text}"
+                )]
+            elif e.response.status_code == 404:
                 return [TextContent(
                     type="text",
                     text=f"Error: Patent publication {pub_num} not found in EPO OPS database."
