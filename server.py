@@ -14,9 +14,12 @@ The server handles publication numbers in various formats commonly cited in offi
 """
 
 import asyncio
+import json
 import os
 import re
 from typing import Any
+from urllib.parse import quote
+from xml.etree import ElementTree as ET
 
 import httpx
 from dotenv import load_dotenv
@@ -201,6 +204,94 @@ async def fetch_images(
         raise
 
 
+async def search_published_data(
+    client: httpx.AsyncClient, query: str, start: int = 1, limit: int = 25
+) -> dict[str, Any]:
+    """Search OPS published data with an Espacenet CQL query."""
+    token = await get_access_token(client)
+    end = start + limit - 1
+    response = await client.get(
+        f"{OPS_BASE_URL}/published-data/search",
+        params={"q": query},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Range": f"{start}-{end}",
+        },
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+async def search_cpc_classes(client: httpx.AsyncClient, query: str) -> str:
+    """Find likely CPC symbols from keywords using the OPS CPC search service."""
+    token = await get_access_token(client)
+    response = await client.get(
+        f"{OPS_BASE_URL}/classification/cpc/search/",
+        params={"q": query},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/cpc+xml",
+        },
+    )
+    response.raise_for_status()
+    return response.text
+
+
+async def fetch_cpc_hierarchy(
+    client: httpx.AsyncClient,
+    symbol: str,
+    depth: int = 1,
+    include_ancestors: bool = True,
+) -> str:
+    """Retrieve a CPC class and its descendants, optionally with ancestors."""
+    token = await get_access_token(client)
+    params: dict[str, str | int] = {"depth": depth}
+    if include_ancestors:
+        params["ancestors"] = ""
+    response = await client.get(
+        f"{OPS_BASE_URL}/classification/cpc/{quote(symbol, safe='/')}",
+        params=params,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/cpc+xml",
+        },
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def parse_cpc_xml(xml_text: str) -> list[dict[str, Any]]:
+    """Convert CPC XML responses into compact, agent-friendly records."""
+    root = ET.fromstring(xml_text)
+    records: list[dict[str, Any]] = []
+    for item in root.iter():
+        item_type = item.tag.rsplit("}", 1)[-1]
+        if item_type not in {"classification-item", "classification-statistics"}:
+            continue
+        symbol = item.attrib.get("classification-symbol")
+        titles: list[str] = []
+        for child in item.iter():
+            local_name = child.tag.rsplit("}", 1)[-1]
+            text = " ".join("".join(child.itertext()).split())
+            if local_name == "classification-symbol" and text:
+                symbol = text
+            elif local_name == "text" and text and text not in titles:
+                titles.append(text)
+        if symbol:
+            record: dict[str, Any] = {
+                "symbol": symbol,
+                "title": " ".join(titles),
+            }
+            for attribute in ("level", "additional-only", "not-allocatable"):
+                if attribute in item.attrib:
+                    record[attribute.replace("-", "_")] = item.attrib[attribute]
+            if "percentage" in item.attrib:
+                record["score"] = float(item.attrib["percentage"])
+            records.append(record)
+    return records
+
+
 # Create MCP server instance
 app = Server("espacenet-ops")
 
@@ -296,6 +387,73 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["publication_number", "search_text"]
             }
+        ),
+        Tool(
+            name="search_patents",
+            description="Search worldwide patent publications in EPO OPS using Espacenet CQL. Supports CPC/IPC, keyword, applicant, inventor, publication-date and other CQL fields; combine them with AND/OR/NOT.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Espacenet CQL query, e.g. 'cpc=H04L9/32 and ta=authentication' or 'ipc=G06F and pd within 2024'"
+                    },
+                    "start": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 1,
+                        "description": "One-based index of the first result"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 25,
+                        "description": "Number of results to return (1-100)"
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        Tool(
+            name="search_cpc",
+            description="Suggest likely Cooperative Patent Classification (CPC) symbols from technical keywords searched against patent titles and abstracts.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Technical keywords or CQL title/abstract query, e.g. 'event camera pixel'"
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        Tool(
+            name="get_cpc_hierarchy",
+            description="Retrieve a CPC symbol, its title, child classes and optionally its ancestors for classification expansion.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "CPC symbol, e.g. H04L9/32"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "default": 1,
+                        "description": "Number of descendant levels to include (0-5)"
+                    },
+                    "include_ancestors": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Include parent classes up to the CPC section"
+                    }
+                },
+                "required": ["symbol"]
+            }
         )
     ]
 
@@ -310,17 +468,45 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             "Set OPS_CONSUMER_KEY and OPS_CONSUMER_SECRET environment variables."
         )
     
-    pub_num = arguments.get("publication_number")
-    if not pub_num:
-        raise ValueError("publication_number is required")
-    
-    try:
-        pub_info = parse_publication_number(pub_num)
-    except ValueError as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
-    
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
+            if name == "search_patents":
+                query = str(arguments.get("query", "")).strip()
+                start = int(arguments.get("start", 1))
+                limit = int(arguments.get("limit", 25))
+                if not query:
+                    raise ValueError("query is required")
+                if start < 1 or not 1 <= limit <= 100:
+                    raise ValueError("start must be at least 1 and limit must be between 1 and 100")
+                data = await search_published_data(client, query, start, limit)
+                return [TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))]
+
+            if name == "search_cpc":
+                query = str(arguments.get("query", "")).strip()
+                if not query:
+                    raise ValueError("query is required")
+                records = parse_cpc_xml(await search_cpc_classes(client, query))
+                return [TextContent(type="text", text=json.dumps({"query": query, "classes": records}, indent=2, ensure_ascii=False))]
+
+            if name == "get_cpc_hierarchy":
+                symbol = re.sub(r"\s+", "", str(arguments.get("symbol", ""))).upper()
+                depth = int(arguments.get("depth", 1))
+                include_ancestors = bool(arguments.get("include_ancestors", True))
+                if not re.fullmatch(r"[A-HY]\d{2}[A-Z](?:\d+(?:/\d+)?)?", symbol):
+                    raise ValueError("symbol must be a CPC symbol such as H04L9/32")
+                if not 0 <= depth <= 5:
+                    raise ValueError("depth must be between 0 and 5")
+                records = parse_cpc_xml(await fetch_cpc_hierarchy(client, symbol, depth, include_ancestors))
+                return [TextContent(type="text", text=json.dumps({"requested_symbol": symbol, "classes": records}, indent=2, ensure_ascii=False))]
+
+            pub_num = arguments.get("publication_number")
+            if not pub_num:
+                raise ValueError("publication_number is required")
+            try:
+                pub_info = parse_publication_number(pub_num)
+            except ValueError as e:
+                return [TextContent(type="text", text=f"Error: {str(e)}")]
+
             if name == "get_patent_biblio":
                 data = await fetch_bibliographic_data(client, pub_info)
                 # Parse and format bibliographic data

@@ -11,11 +11,15 @@ from dotenv import load_dotenv
 
 # Import server functions
 from server import (
+    fetch_cpc_hierarchy,
     parse_publication_number,
+    parse_cpc_xml,
     get_access_token,
     fetch_bibliographic_data,
     fetch_claims,
     fetch_description,
+    search_cpc_classes,
+    search_published_data,
 )
 
 import httpx
@@ -107,6 +111,30 @@ async def test_fetch_patent_data():
         print(f"✗ Error: {e}")
 
 
+async def test_search_tools():
+    """Test patent and CPC classification searches."""
+    print("\nTesting patent and CPC search tools...")
+    print("-" * 80)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            patents = await search_published_data(client, "cpc=H04L9/32", 1, 2)
+            print(f"✓ Patent classification search returned data: {bool(patents)}")
+
+            suggestions = parse_cpc_xml(
+                await search_cpc_classes(client, "event camera pixel")
+            )
+            print(f"✓ CPC keyword search returned {len(suggestions)} class(es)")
+
+            hierarchy = parse_cpc_xml(
+                await fetch_cpc_hierarchy(client, "H04L9/32", 1, True)
+            )
+            print(f"✓ CPC hierarchy returned {len(hierarchy)} class(es)")
+    except Exception as e:
+        print(f"✗ Search tool error: {e}")
+        raise
+
+
 async def main():
     """Run all tests."""
     print("\n" + "=" * 80)
@@ -122,6 +150,7 @@ async def main():
     # Test 3: Fetch patent data (only if API connection works)
     if api_ok:
         await test_fetch_patent_data()
+        await test_search_tools()
     
     print("\n" + "=" * 80)
     print("Tests complete!")
