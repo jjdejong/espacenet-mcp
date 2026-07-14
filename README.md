@@ -12,6 +12,25 @@ Built for patent attorneys to quickly retrieve patent specifications, claims, an
 - 🌍 Support for EP, US, WO, and other publication formats
 - ⚡ Fast access during patent prosecution workflow
 
+## Compact, recall-safe search defaults
+
+`search_patents` returns compact publication identifiers and pagination metadata rather than the
+raw OPS response. It returns 25 identifiers by default and accepts up to 100; use `start` and
+`next_start` to paginate a high-signal query. Use `raw: true` only for diagnostics, then call
+`get_patent_biblio` for shortlisted identifiers. The search endpoint covers bibliographic data and
+title/abstract text, not claims or description full text.
+
+U.S. pre-grant publications are emitted in conventional zero-padded form while both conventional and
+OPS epodoc forms are accepted as input. OPS may return any member of a patent family; retain a pertinent
+member during discovery and resolve a convenient-language equivalent during verification.
+
+Ambiguous aliases such as `an=` and `applicant=` are rejected with guidance. Use `pa=` for applicant,
+`in=` for inventor, and `get_patent_biblio` for a known publication number.
+
+`find_text_in_patent` returns bounded excerpts (five by default) instead of complete neighbouring
+paragraphs. This is the preferred screening tool before requesting full claims or descriptions.
+OPS 404 search responses are normalized to an empty result set without replaying the XML fault body.
+
 ## Quick Start
 
 See [QUICKSTART.md](QUICKSTART.md) for complete setup instructions.

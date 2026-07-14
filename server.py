@@ -50,6 +50,50 @@ OPS_AUTH_URL = "https://ops.epo.org/3.2/auth/accesstoken"
 access_token: str | None = None
 token_expiry: float = 0
 
+DEFAULT_SEARCH_RESULTS = 25
+MAX_SEARCH_RESULTS = 100
+MAX_CPC_RESULTS = 20
+DEFAULT_EXCERPT_CONTEXT_CHARS = 300
+MAX_EXCERPT_CONTEXT_CHARS = 1000
+MAX_EXCERPT_MATCHES = 10
+
+
+def _is_us_pregrant(country: str, number: str, kind: str) -> bool:
+    return (
+        country == "US"
+        and kind.startswith("A")
+        and len(number) > 4
+        and number[:4].startswith(("19", "20"))
+        and number[4:].isdigit()
+    )
+
+
+def canonical_document_number(country: str, number: str, kind: str) -> str:
+    """Return the conventional display form of a publication number body."""
+    if _is_us_pregrant(country, number, kind):
+        return f"{number[:4]}{number[4:].zfill(7)}"
+    return number
+
+
+def canonicalize_biblio_publication(parsed: dict[str, Any]) -> dict[str, Any]:
+    publication = parsed.get("publication")
+    if isinstance(publication, dict):
+        country = str(publication.get("country", "")).upper()
+        number = re.sub(r"\D", "", str(publication.get("number", "")))
+        kind = str(publication.get("kind", "")).upper()
+        if number:
+            publication["number"] = canonical_document_number(
+                country, number, kind
+            )
+    return parsed
+
+
+def ops_document_number(country: str, number: str, kind: str) -> str:
+    """Return the epodoc number expected by OPS."""
+    if _is_us_pregrant(country, number, kind):
+        return f"{number[:4]}{int(number[4:])}"
+    return str(int(number))
+
 
 def parse_publication_number(pub_num: str) -> dict[str, str]:
     """
@@ -75,10 +119,15 @@ def parse_publication_number(pub_num: str) -> dict[str, str]:
     
     country_code, number, kind_code = match.groups()
     
+    canonical_number = canonical_document_number(
+        country_code, number, kind_code or ""
+    )
     return {
         "country": country_code,
-        "doc_number": str(int(number)),  # Remove leading zeros for EPO OPS
-        "doc_number_full": number,  # Keep leading zeros for Google Patents
+        "doc_number": ops_document_number(
+            country_code, canonical_number, kind_code or ""
+        ),
+        "doc_number_full": canonical_number,
         "kind": kind_code or "",
         "format": "epodoc"  # EPO document format
     }
@@ -205,7 +254,10 @@ async def fetch_images(
 
 
 async def search_published_data(
-    client: httpx.AsyncClient, query: str, start: int = 1, limit: int = 25
+    client: httpx.AsyncClient,
+    query: str,
+    start: int = 1,
+    limit: int = DEFAULT_SEARCH_RESULTS,
 ) -> dict[str, Any]:
     """Search OPS published data with an Espacenet CQL query."""
     token = await get_access_token(client)
@@ -292,6 +344,156 @@ def parse_cpc_xml(xml_text: str) -> list[dict[str, Any]]:
     return records
 
 
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _ops_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("$", ""))
+    return str(value or "")
+
+
+def _ops_key(mapping: Any, name: str, default: Any = None) -> Any:
+    if not isinstance(mapping, dict):
+        return default
+    return mapping.get(name, mapping.get(f"ops:{name}", default))
+
+
+def _publication_number(reference: Any) -> str:
+    """Extract one stable publication identifier from an OPS search reference."""
+    document_ids = _as_list(_ops_key(reference, "document-id"))
+    if not document_ids:
+        publication_reference = _ops_key(reference, "publication-reference")
+        document_ids = _as_list(_ops_key(publication_reference, "document-id"))
+    preferred = next(
+        (
+            item
+            for item in document_ids
+            if isinstance(item, dict)
+            and item.get("@document-id-type") == "docdb"
+        ),
+        document_ids[0] if document_ids else {},
+    )
+    if not isinstance(preferred, dict):
+        return ""
+    country = _ops_text(_ops_key(preferred, "country")).upper()
+    number = re.sub(r"\D", "", _ops_text(_ops_key(preferred, "doc-number")))
+    kind = _ops_text(_ops_key(preferred, "kind")).upper()
+    number = canonical_document_number(country, number, kind)
+    return f"{country}{number}{kind}" if country and number else ""
+
+
+def validate_cql_query(query: str) -> None:
+    """Reject ambiguous field aliases that previously caused silent recall loss."""
+    fields = {
+        match.group(1).lower()
+        for match in re.finditer(
+            r"\b([A-Za-z][A-Za-z0-9]*)\s*(?:=|within\b|<=|>=|<|>)",
+            query,
+            re.IGNORECASE,
+        )
+    }
+    invalid = fields & {"an", "applicant", "inventor"}
+    if invalid:
+        names = ", ".join(sorted(invalid))
+        raise ValueError(
+            f"Unsupported or ambiguous CQL field(s): {names}. "
+            "Use pa= for applicant and in= for inventor. For a known "
+            "publication number, call get_patent_biblio instead of search_patents."
+        )
+
+
+def compact_search_response(
+    data: dict[str, Any], query: str, start: int, requested_limit: int
+) -> dict[str, Any]:
+    """Reduce an OPS search response to identifiers and pagination metadata."""
+    world = data.get("ops:world-patent-data", data.get("world-patent-data", {}))
+    search = _ops_key(world, "biblio-search", {})
+    search_result = _ops_key(search, "search-result", {})
+    references = _as_list(_ops_key(search_result, "publication-reference"))
+
+    seen: set[str] = set()
+    results: list[dict[str, str]] = []
+    for reference in references:
+        publication_number = _publication_number(reference)
+        if not publication_number or publication_number in seen:
+            continue
+        seen.add(publication_number)
+        results.append(
+            {
+                "publication_number": publication_number,
+                "google_patents_url": (
+                    f"https://patents.google.com/patent/{publication_number}/en"
+                ),
+            }
+        )
+        if len(results) >= min(requested_limit, MAX_SEARCH_RESULTS):
+            break
+
+    try:
+        total = int(search.get("@total-result-count", len(results)))
+    except (TypeError, ValueError):
+        total = len(results)
+    consumed = max(len(references), len(results))
+    end = start + consumed - 1 if consumed else start - 1
+    response: dict[str, Any] = {
+        "query": query,
+        "total_results": total,
+        "start": start,
+        "requested_limit": requested_limit,
+        "effective_limit": min(requested_limit, MAX_SEARCH_RESULTS),
+        "returned": len(results),
+        "deduplication": "publication_number",
+        "results": results,
+        "note": (
+            "Use get_patent_biblio only for shortlisted identifiers; search output "
+            "intentionally omits raw OPS payloads. OPS may return any member of a "
+            "pertinent family; retain the hit and resolve a convenient-language "
+            "equivalent during verification."
+        ),
+    }
+    if end < total:
+        response["next_start"] = end + 1
+    return response
+
+
+def no_search_results_response(
+    query: str, start: int, requested_limit: int
+) -> dict[str, Any]:
+    return {
+        "query": query,
+        "total_results": 0,
+        "start": start,
+        "requested_limit": requested_limit,
+        "effective_limit": min(requested_limit, MAX_SEARCH_RESULTS),
+        "returned": 0,
+        "results": [],
+        "note": (
+            "No OPS results found. Broaden terminology or use a full-text patent "
+            "source before adding classification constraints."
+        ),
+    }
+
+
+def excerpt_around(text: str, needle: str, context_chars: int) -> str:
+    """Return a bounded excerpt centred on a case-insensitive literal match."""
+    normalized_text = " ".join(text.split())
+    normalized_needle = " ".join(needle.split())
+    index = normalized_text.lower().find(normalized_needle.lower())
+    if index < 0:
+        return normalized_text[: context_chars * 2]
+    start = max(0, index - context_chars)
+    end = min(
+        len(normalized_text), index + len(normalized_needle) + context_chars
+    )
+    prefix = "…" if start else ""
+    suffix = "…" if end < len(normalized_text) else ""
+    return f"{prefix}{normalized_text[start:end]}{suffix}"
+
+
 # Create MCP server instance
 app = Server("espacenet-ops")
 
@@ -372,7 +574,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="find_text_in_patent",
-            description="Search for quoted text in a patent's description and identify the paragraph number. Useful when examiner cites column/line numbers with a quote.",
+            description="Search for literal text in a patent description and return bounded matching excerpts. Prefer this over retrieving a complete description during screening.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -383,6 +585,20 @@ async def list_tools() -> list[Tool]:
                     "search_text": {
                         "type": "string",
                         "description": "Text excerpt to find in the patent description (e.g., text quoted by examiner)"
+                    },
+                    "max_matches": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_EXCERPT_MATCHES,
+                        "default": 5,
+                        "description": "Maximum matching excerpts to return (1-10)"
+                    },
+                    "context_chars": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_EXCERPT_CONTEXT_CHARS,
+                        "default": DEFAULT_EXCERPT_CONTEXT_CHARS,
+                        "description": "Characters of surrounding context on each side (0-1000)"
                     }
                 },
                 "required": ["publication_number", "search_text"]
@@ -390,13 +606,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_patents",
-            description="Search worldwide patent publications in EPO OPS using Espacenet CQL. Supports CPC/IPC, keyword, applicant, inventor, publication-date and other CQL fields; combine them with AND/OR/NOT.",
+            description="Search EPO OPS bibliographic data and title/abstract text using Espacenet CQL; this is not a claims or description full-text search. Returns compact publication identifiers with pagination metadata. Use pa= for applicant, in= for inventor, parenthesise mixed AND/OR expressions, and use get_patent_biblio for a known publication number.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Espacenet CQL query, e.g. 'cpc=H04L9/32 and ta=authentication' or 'ipc=G06F and pd within 2024'"
+                        "description": "Espacenet CQL query, e.g. 'cpc=H04L9/32 and ta=authentication' or '(pa=prophesee or pa=omnivision) and (ta=event or ta=frame)'"
                     },
                     "start": {
                         "type": "integer",
@@ -407,9 +623,14 @@ async def list_tools() -> list[Tool]:
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 100,
-                        "default": 25,
-                        "description": "Number of results to return (1-100)"
+                        "maximum": MAX_SEARCH_RESULTS,
+                        "default": DEFAULT_SEARCH_RESULTS,
+                        "description": "Number of compact results to return (1-100). Use start/next_start to paginate a high-signal query."
+                    },
+                    "raw": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Return raw OPS JSON for diagnostics. Keep false during normal research."
                     }
                 },
                 "required": ["query"]
@@ -473,20 +694,52 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if name == "search_patents":
                 query = str(arguments.get("query", "")).strip()
                 start = int(arguments.get("start", 1))
-                limit = int(arguments.get("limit", 25))
+                requested_limit = int(arguments.get("limit", DEFAULT_SEARCH_RESULTS))
+                limit = min(requested_limit, MAX_SEARCH_RESULTS)
+                raw = arguments.get("raw") is True
                 if not query:
                     raise ValueError("query is required")
-                if start < 1 or not 1 <= limit <= 100:
-                    raise ValueError("start must be at least 1 and limit must be between 1 and 100")
-                data = await search_published_data(client, query, start, limit)
-                return [TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))]
+                if start < 1 or requested_limit < 1:
+                    raise ValueError("start and limit must be at least 1")
+                validate_cql_query(query)
+                try:
+                    data = await search_published_data(client, query, start, limit)
+                except httpx.HTTPStatusError as error:
+                    if error.response.status_code == 404:
+                        compact = no_search_results_response(
+                            query, start, requested_limit
+                        )
+                        return [TextContent(
+                            type="text",
+                            text=json.dumps(compact, ensure_ascii=False),
+                        )]
+                    raise
+                payload = (
+                    data
+                    if raw
+                    else compact_search_response(
+                        data, query, start, requested_limit
+                    )
+                )
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False),
+                )]
 
             if name == "search_cpc":
                 query = str(arguments.get("query", "")).strip()
                 if not query:
                     raise ValueError("query is required")
                 records = parse_cpc_xml(await search_cpc_classes(client, query))
-                return [TextContent(type="text", text=json.dumps({"query": query, "classes": records}, indent=2, ensure_ascii=False))]
+                payload = {
+                    "query": query,
+                    "returned": min(len(records), MAX_CPC_RESULTS),
+                    "classes": records[:MAX_CPC_RESULTS],
+                }
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False),
+                )]
 
             if name == "get_cpc_hierarchy":
                 symbol = re.sub(r"\s+", "", str(arguments.get("symbol", ""))).upper()
@@ -497,7 +750,15 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 if not 0 <= depth <= 5:
                     raise ValueError("depth must be between 0 and 5")
                 records = parse_cpc_xml(await fetch_cpc_hierarchy(client, symbol, depth, include_ancestors))
-                return [TextContent(type="text", text=json.dumps({"requested_symbol": symbol, "classes": records}, indent=2, ensure_ascii=False))]
+                payload = {
+                    "requested_symbol": symbol,
+                    "returned": min(len(records), MAX_CPC_RESULTS),
+                    "classes": records[:MAX_CPC_RESULTS],
+                }
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False),
+                )]
 
             pub_num = arguments.get("publication_number")
             if not pub_num:
@@ -510,7 +771,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if name == "get_patent_biblio":
                 data = await fetch_bibliographic_data(client, pub_info)
                 # Parse and format bibliographic data
-                parsed = parse_biblio_json(data)
+                parsed = canonicalize_biblio_publication(parse_biblio_json(data))
                 formatted = format_biblio_for_display(parsed)
                 return [TextContent(
                     type="text",
@@ -578,7 +839,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         type="text",
                         text="Error: search_text is required"
                     )]
-                
+
+                max_matches = int(arguments.get("max_matches", 5))
+                context_chars = int(
+                    arguments.get(
+                        "context_chars", DEFAULT_EXCERPT_CONTEXT_CHARS
+                    )
+                )
+                if not 1 <= max_matches <= MAX_EXCERPT_MATCHES:
+                    raise ValueError("max_matches must be between 1 and 10")
+                if not 0 <= context_chars <= MAX_EXCERPT_CONTEXT_CHARS:
+                    raise ValueError("context_chars must be between 0 and 1000")
+
                 # Get description
                 description_xml = await fetch_description(client, pub_info)
                 parsed = parse_description_xml(description_xml)
@@ -594,39 +866,44 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                             matches.append({
                                 "section": section.get("heading", "Unknown section"),
                                 "paragraph_index": i,
-                                "text": para,
-                                "context_before": section["paragraphs"][i-1] if i > 0 else None,
-                                "context_after": section["paragraphs"][i+1] if i < len(section["paragraphs"])-1 else None
+                                "excerpt": excerpt_around(
+                                    para, str(search_text), context_chars
+                                ),
                             })
+                            if len(matches) >= max_matches:
+                                break
+                    if len(matches) >= max_matches:
+                        break
                 
                 if not matches:
                     return [TextContent(
                         type="text",
-                        text=f"Text not found in {pub_num}.\n\nSearched for: {search_text}\n\nThe quoted text may be in the claims instead of the description, or may be paraphrased differently in the XML version."
+                        text=json.dumps(
+                            {
+                                "publication_number": str(pub_num),
+                                "search_text": str(search_text),
+                                "returned": 0,
+                                "matches": [],
+                                "note": (
+                                    "The text may be paraphrased or may occur in "
+                                    "the claims instead of the description."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
                     )]
-                
-                # Format results
-                output = [f"Found {len(matches)} match(es) in {pub_num}:\n"]
-                for idx, match in enumerate(matches, 1):
-                    output.append(f"\nMatch {idx}:")
-                    output.append(f"Section: {match['section']}")
-                    output.append(f"Paragraph index in section: {match['paragraph_index']}")
-                    output.append(f"\nMatching text:")
-                    output.append(match['text'])
-                    
-                    if match['context_before']:
-                        output.append(f"\nPrevious paragraph:")
-                        output.append(match['context_before'])
-                    
-                    if match['context_after']:
-                        output.append(f"\nNext paragraph:")
-                        output.append(match['context_after'])
-                    
-                    output.append("\n" + "="*80)
                 
                 return [TextContent(
                     type="text",
-                    text="\n".join(output)
+                    text=json.dumps(
+                        {
+                            "publication_number": str(pub_num),
+                            "search_text": str(search_text),
+                            "returned": len(matches),
+                            "matches": matches,
+                        },
+                        ensure_ascii=False,
+                    )
                 )]
             
             elif name == "get_full_patent_data":
@@ -672,7 +949,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if name in {"search_patents", "search_cpc", "get_cpc_hierarchy"}:
                 return [TextContent(
                     type="text",
-                    text=f"Error: {name} request failed: HTTP {e.response.status_code} - {e.response.text}"
+                    text=(
+                        f"Error: {name} request failed with HTTP "
+                        f"{e.response.status_code}. Broaden or correct the query; "
+                        "raw server bodies are omitted."
+                    )
                 )]
             elif e.response.status_code == 404:
                 return [TextContent(
