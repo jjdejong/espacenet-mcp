@@ -494,7 +494,10 @@ def format_biblio_for_display(biblio_data: Dict[str, Any]) -> str:
         for cited in biblio_data["cited_documents"]:
             marker = f" [{cited['category']}]" if cited.get("category") else ""
             phase = f" ({cited['phase']})" if cited.get("phase") else ""
-            output.append(f"  - {cited['number']}{marker}{phase}")
+            title = f" — {cited['title']}" if cited.get("title") else ""
+            output.append(f"  - {cited['number']}{marker}{phase}{title}")
+            if cited.get("abstract_hint"):
+                output.append(f"    Abstract hint: {cited['abstract_hint']}")
         if any(cited.get("category") for cited in biblio_data["cited_documents"]):
             output.append(
                 "  Categories: X = particularly relevant alone; Y = relevant combined; "

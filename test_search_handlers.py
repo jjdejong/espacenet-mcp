@@ -197,6 +197,40 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(error["retryable"])
         self.assertIn("retry this call once", error["message"])
 
+    async def test_unlabelled_search_report_citations_get_bounded_screening_hints(self):
+        citations = [
+            {
+                "number": f"EP100000{i}A1",
+                "category": "",
+                "phase": "national-search-report",
+            }
+            for i in range(1, 7)
+        ]
+        citations.append(
+            {"number": "EP2000001A1", "category": "", "phase": "applicant"}
+        )
+        parsed = {"cited_documents": citations}
+        fetched = AsyncMock(return_value={"payload": True})
+        hint = {
+            "publication": {},
+            "cited_documents": [],
+            "title": "Dual mode optical sensor",
+            "abstract": "A sensor produces image data and asynchronous event data.",
+        }
+        with patch.object(server, "fetch_bibliographic_data", fetched), patch.object(
+            server, "parse_biblio_json", return_value=hint
+        ):
+            enriched = await server.enrich_search_report_citations(object(), parsed)
+
+        self.assertEqual(fetched.await_count, server.MAX_SEARCH_REPORT_CITATION_HINTS)
+        self.assertEqual(citations[0]["title"], "Dual mode optical sensor")
+        self.assertIn("asynchronous event data", citations[0]["abstract_hint"])
+        self.assertNotIn("title", citations[5])
+        self.assertNotIn("title", citations[6])
+        formatted = server.format_biblio_for_display(enriched)
+        self.assertIn("EP1000001A1 (national-search-report) — Dual mode optical sensor", formatted)
+        self.assertIn("Abstract hint: A sensor produces image data", formatted)
+
     async def test_search_404_returns_compact_no_results(self):
         request = httpx.Request("GET", "https://ops.epo.org/search")
         response = httpx.Response(404, request=request, text="not found")

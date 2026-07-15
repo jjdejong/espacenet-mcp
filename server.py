@@ -68,6 +68,9 @@ MAX_EXCERPT_CONTEXT_CHARS = 1000
 MAX_EXCERPT_MATCHES = 10
 DEFAULT_FULLTEXT_RESULTS = 10
 MAX_FULLTEXT_RESULTS = 10
+MAX_SEARCH_REPORT_CITATION_HINTS = 5
+CITATION_TITLE_CHARS = 200
+CITATION_ABSTRACT_CHARS = 260
 USPTO_PDF_BASE_URL = "https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf"
 USPTO_OCR_CONCURRENCY = 4
 
@@ -438,6 +441,51 @@ async def fetch_bibliographic_data(
     response.raise_for_status()
     
     return response.json()
+
+
+async def enrich_search_report_citations(
+    client: httpx.AsyncClient, parsed: dict[str, Any]
+) -> dict[str, Any]:
+    """Add bounded screening hints to unlabelled search-report citations.
+
+    OPS sometimes returns useful national-search-report citations without X/Y/A
+    categories.  Fetching every cited document through separate model tool calls
+    is slow and token-heavy, so enrich at most five with only title and a short
+    abstract.  Failures are deliberately local to the individual citation.
+    """
+    candidates = [
+        cited
+        for cited in parsed.get("cited_documents", [])
+        if isinstance(cited, dict)
+        and not str(cited.get("category", "")).strip()
+        and str(cited.get("phase", "")).casefold() == "national-search-report"
+        and str(cited.get("number", "")).strip()
+    ][:MAX_SEARCH_REPORT_CITATION_HINTS]
+
+    async def enrich_one(cited: dict[str, Any]) -> None:
+        try:
+            pub_info = parse_publication_number(str(cited["number"]))
+            data = await fetch_bibliographic_data(client, pub_info)
+            hint = canonicalize_biblio_publication(parse_biblio_json(data))
+            title = " ".join(str(hint.get("title", "")).split())
+            abstract = " ".join(str(hint.get("abstract", "")).split())
+            if title:
+                cited["title"] = (
+                    title
+                    if len(title) <= CITATION_TITLE_CHARS
+                    else title[: CITATION_TITLE_CHARS - 1].rstrip() + "…"
+                )
+            if abstract:
+                cited["abstract_hint"] = (
+                    abstract
+                    if len(abstract) <= CITATION_ABSTRACT_CHARS
+                    else abstract[: CITATION_ABSTRACT_CHARS - 1].rstrip() + "…"
+                )
+        except Exception:
+            return
+
+    await asyncio.gather(*(enrich_one(cited) for cited in candidates))
+    return parsed
 
 
 async def fetch_description(
@@ -1214,6 +1262,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 data = await fetch_bibliographic_data(client, pub_info)
                 # Parse and format bibliographic data
                 parsed = canonicalize_biblio_publication(parse_biblio_json(data))
+                parsed = await enrich_search_report_citations(client, parsed)
                 formatted = format_biblio_for_display(parsed)
                 return [TextContent(
                     type="text",
