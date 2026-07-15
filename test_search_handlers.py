@@ -161,6 +161,42 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(json.loads(text)["requested_symbol"], "H04N25/00")
 
+    async def test_get_cpc_hierarchy_bounds_records_and_parent_titles(self):
+        children = "".join(
+            f'<classification-item classification-symbol="H04N25/{index}">'
+            f'<class-title><text>Child title {index}</text></class-title>'
+            "</classification-item>"
+            for index in range(12)
+        )
+        xml = (
+            '<root><classification-item classification-symbol="H04N25/00">'
+            '<class-title><text>Parent image-sensor title</text></class-title>'
+            f"{children}</classification-item></root>"
+        )
+        with patch.object(server, "fetch_cpc_hierarchy", AsyncMock(return_value=xml)):
+            text = await self.call(
+                "get_cpc_hierarchy", {"symbol": "H04N25/00", "depth": 2}
+            )
+        result = json.loads(text)
+        self.assertEqual(result["returned"], server.DEFAULT_CPC_HIERARCHY_RESULTS)
+        self.assertEqual(len(result["classes"]), server.DEFAULT_CPC_HIERARCHY_RESULTS)
+        self.assertEqual(result["classes"][0]["title"], "Parent image-sensor title")
+        self.assertNotIn("Child title", result["classes"][0]["title"])
+
+    async def test_timeout_error_is_typed_and_retryable(self):
+        with patch.object(
+            server,
+            "fetch_bibliographic_data",
+            AsyncMock(side_effect=httpx.ReadTimeout("")),
+        ):
+            text = await self.call(
+                "get_patent_biblio", {"publication_number": "EP4391573A1"}
+            )
+        error = json.loads(text)["error"]
+        self.assertEqual(error["type"], "timeout")
+        self.assertTrue(error["retryable"])
+        self.assertIn("retry this call once", error["message"])
+
     async def test_search_404_returns_compact_no_results(self):
         request = httpx.Request("GET", "https://ops.epo.org/search")
         response = httpx.Response(404, request=request, text="not found")
@@ -185,6 +221,143 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
             "properties"
         ]
         self.assertEqual(excerpt_properties["max_matches"]["maximum"], 10)
+
+    async def test_search_hits_carry_title_and_bounded_abstract(self):
+        long_abstract = (
+            "An optical apparatus includes a sensing element producing a first "
+            "signal and a second signal read out through separate circuits. "
+        ) * 5
+        payload = {
+            "ops:world-patent-data": {
+                "ops:biblio-search": {
+                    "@total-result-count": "1",
+                    "ops:search-result": {
+                        "exchange-documents": {
+                            "exchange-document": {
+                                "abstract": {
+                                    "@lang": "en",
+                                    "p": {"$": long_abstract},
+                                },
+                                "bibliographic-data": {
+                                    "publication-reference": {
+                                        "document-id": {
+                                            "@document-id-type": "docdb",
+                                            "country": {"$": "EP"},
+                                            "doc-number": {"$": "4391573"},
+                                            "kind": {"$": "A1"},
+                                        }
+                                    },
+                                    "invention-title": [
+                                        {"@lang": "de", "$": "Titel"},
+                                        {"@lang": "en", "$": "Generic sensing device"},
+                                    ],
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        with patch.object(
+            server, "search_published_data", AsyncMock(return_value=payload)
+        ):
+            text = await self.call("search_patents", {"query": "cpc=G01J"})
+        hit = json.loads(text)["results"][0]
+        self.assertEqual(hit["publication_number"], "EP4391573A1")
+        self.assertEqual(hit["title"], "Generic sensing device")
+        self.assertLessEqual(
+            len(hit["abstract"]), server.ABSTRACT_SNIPPET_CHARS + 1
+        )
+        self.assertTrue(hit["abstract"].endswith("…"))
+
+    async def test_biblio_surfaces_citations_cpc_abstract_and_family(self):
+        payload = {
+            "ops:world-patent-data": {
+                "exchange-documents": {
+                    "exchange-document": {
+                        "@family-id": "84982418",
+                        "abstract": {
+                            "@lang": "en",
+                            "p": {"$": "A merged frame-based and event-based pixel."},
+                        },
+                        "bibliographic-data": {
+                            "publication-reference": {
+                                "document-id": {
+                                    "country": {"$": "EP"},
+                                    "doc-number": {"$": "4391573"},
+                                    "kind": {"$": "A1"},
+                                    "date": {"$": "20240626"},
+                                }
+                            },
+                            "patent-classifications": {
+                                "patent-classification": [
+                                    {
+                                        "classification-scheme": {"@scheme": "CPCI"},
+                                        "section": {"$": "H"},
+                                        "class": {"$": "04"},
+                                        "subclass": {"$": "N"},
+                                        "main-group": {"$": "25"},
+                                        "subgroup": {"$": "47"},
+                                    }
+                                ]
+                            },
+                            "references-cited": {
+                                "citation": [
+                                    {
+                                        "@cited-phase": "national-search-report",
+                                        "category": [{"$": "X"}, {"$": "Y"}],
+                                        "patcit": {
+                                            "document-id": [
+                                                {
+                                                    "@document-id-type": "docdb",
+                                                    "country": {"$": "US"},
+                                                    "doc-number": {"$": "2022201236"},
+                                                    "kind": {"$": "A1"},
+                                                }
+                                            ]
+                                        },
+                                    },
+                                    {
+                                        "@cited-phase": "undefined",
+                                        "nplcit": {
+                                            "text": {
+                                                "$": "- LALANNE ET AL: A native HDR pixel"
+                                            }
+                                        },
+                                    },
+                                ]
+                            },
+                        },
+                    }
+                }
+            }
+        }
+        with patch.object(
+            server, "fetch_bibliographic_data", AsyncMock(return_value=payload)
+        ):
+            text = await self.call(
+                "get_patent_biblio", {"publication_number": "EP4391573A1"}
+            )
+        self.assertIn("US20220201236A1 [X Y] (national-search-report)", text)
+        self.assertIn("CPC Classifications:", text)
+        self.assertIn("H04N25/47", text)
+        self.assertIn("Abstract:", text)
+        self.assertIn("merged frame-based and event-based pixel", text)
+        self.assertIn("LALANNE ET AL: A native HDR pixel", text)
+        self.assertNotIn("(undefined)", text)
+        self.assertIn("INPADOC Family ID: 84982418", text)
+
+    async def test_find_text_falls_back_when_ops_lacks_description(self):
+        request = httpx.Request("GET", "https://ops.epo.org/description")
+        response = httpx.Response(404, request=request, text="not found")
+        error = httpx.HTTPStatusError("not found", request=request, response=response)
+        with patch.object(server, "fetch_description", AsyncMock(side_effect=error)):
+            text = await self.call(
+                "find_text_in_patent",
+                {"publication_number": "US2022201236A1", "search_text": "anode"},
+            )
+        self.assertIn("Description text not available", text)
+        self.assertIn("patents.google.com/patent/US20220201236A1/en", text)
 
     def test_excerpt_is_bounded_around_match(self):
         text = "a" * 500 + " event driven sensing " + "b" * 500

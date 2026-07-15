@@ -52,7 +52,12 @@ token_expiry: float = 0
 
 DEFAULT_SEARCH_RESULTS = 25
 MAX_SEARCH_RESULTS = 100
+# Abstract excerpt length per search hit; bounds screening cost to roughly
+# 75 tokens per result while keeping the device-and-elements opening sentences.
+ABSTRACT_SNIPPET_CHARS = 300
 MAX_CPC_RESULTS = 20
+DEFAULT_CPC_HIERARCHY_RESULTS = 10
+MAX_CPC_TITLE_CHARS = 240
 DEFAULT_EXCERPT_CONTEXT_CHARS = 300
 MAX_EXCERPT_CONTEXT_CHARS = 1000
 MAX_EXCERPT_MATCHES = 10
@@ -85,6 +90,13 @@ def canonicalize_biblio_publication(parsed: dict[str, Any]) -> dict[str, Any]:
             publication["number"] = canonical_document_number(
                 country, number, kind
             )
+    for cited in parsed.get("cited_documents", []):
+        if not isinstance(cited, dict):
+            continue
+        match = re.fullmatch(r"([A-Z]{2})(\d+)([A-Z]\d?)", str(cited.get("number", "")).upper())
+        if match:
+            country, number, kind = match.groups()
+            cited["number"] = f"{country}{canonical_document_number(country, number, kind)}{kind}"
     return parsed
 
 
@@ -259,11 +271,15 @@ async def search_published_data(
     start: int = 1,
     limit: int = DEFAULT_SEARCH_RESULTS,
 ) -> dict[str, Any]:
-    """Search OPS published data with an Espacenet CQL query."""
+    """Search OPS published data with an Espacenet CQL query.
+
+    Requests the ``biblio`` constituent so each hit carries its title and
+    abstract for screening; ``compact_search_response`` bounds what survives.
+    """
     token = await get_access_token(client)
     end = start + limit - 1
     response = await client.get(
-        f"{OPS_BASE_URL}/published-data/search",
+        f"{OPS_BASE_URL}/published-data/search/biblio",
         params={"q": query},
         headers={
             "Authorization": f"Bearer {token}",
@@ -317,23 +333,41 @@ def parse_cpc_xml(xml_text: str) -> list[dict[str, Any]]:
     """Convert CPC XML responses into compact, agent-friendly records."""
     root = ET.fromstring(xml_text)
     records: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+
+    def compact_item_text(item: ET.Element) -> tuple[str | None, list[str]]:
+        symbol = item.attrib.get("classification-symbol")
+        titles: list[str] = []
+
+        def visit(node: ET.Element) -> None:
+            nonlocal symbol
+            for child in node:
+                local_name = child.tag.rsplit("}", 1)[-1]
+                if local_name in {"classification-item", "classification-statistics"}:
+                    continue
+                text = " ".join("".join(child.itertext()).split())
+                if local_name == "classification-symbol" and text:
+                    symbol = text
+                elif local_name == "text" and text and text not in titles:
+                    titles.append(text)
+                else:
+                    visit(child)
+
+        visit(item)
+        return symbol, titles
+
     for item in root.iter():
         item_type = item.tag.rsplit("}", 1)[-1]
         if item_type not in {"classification-item", "classification-statistics"}:
             continue
-        symbol = item.attrib.get("classification-symbol")
-        titles: list[str] = []
-        for child in item.iter():
-            local_name = child.tag.rsplit("}", 1)[-1]
-            text = " ".join("".join(child.itertext()).split())
-            if local_name == "classification-symbol" and text:
-                symbol = text
-            elif local_name == "text" and text and text not in titles:
-                titles.append(text)
-        if symbol:
+        symbol, titles = compact_item_text(item)
+        if symbol and symbol not in seen_symbols:
+            title = " ".join(titles)
+            if len(title) > MAX_CPC_TITLE_CHARS:
+                title = title[: MAX_CPC_TITLE_CHARS - 1].rstrip() + "…"
             record: dict[str, Any] = {
                 "symbol": symbol,
-                "title": " ".join(titles),
+                "title": title,
             }
             for attribute in ("level", "additional-only", "not-allocatable"):
                 if attribute in item.attrib:
@@ -341,6 +375,7 @@ def parse_cpc_xml(xml_text: str) -> list[dict[str, Any]]:
             if "percentage" in item.attrib:
                 record["score"] = float(item.attrib["percentage"])
             records.append(record)
+            seen_symbols.add(symbol)
     return records
 
 
@@ -406,32 +441,85 @@ def validate_cql_query(query: str) -> None:
         )
 
 
+def _preferred_language_entry(value: Any) -> Any:
+    """Pick the English entry from an OPS single-or-list language field."""
+    entries = _as_list(value)
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("@lang") == "en":
+            return entry
+    return entries[0] if entries else None
+
+
+def _search_hit_title(bibliographic_data: Any) -> str:
+    title = _preferred_language_entry(_ops_key(bibliographic_data, "invention-title"))
+    return _ops_text(title) if title is not None else ""
+
+
+def _search_hit_abstract(exchange_document: Any) -> str:
+    abstract = _preferred_language_entry(_ops_key(exchange_document, "abstract"))
+    if not isinstance(abstract, dict):
+        return ""
+    paragraphs = [_ops_text(p) for p in _as_list(abstract.get("p"))]
+    return " ".join(part.strip() for part in paragraphs if part).strip()
+
+
+def _snippet(text: str, max_chars: int) -> str:
+    """Whitespace-normalise and truncate at a word boundary with an ellipsis."""
+    normalized = " ".join(text.split())
+    if max_chars <= 0 or len(normalized) <= max_chars:
+        return normalized
+    cut = normalized.rfind(" ", 0, max_chars)
+    if cut <= 0:
+        cut = max_chars
+    return normalized[:cut] + "…"
+
+
 def compact_search_response(
-    data: dict[str, Any], query: str, start: int, requested_limit: int
+    data: dict[str, Any],
+    query: str,
+    start: int,
+    requested_limit: int,
+    abstract_chars: int = ABSTRACT_SNIPPET_CHARS,
 ) -> dict[str, Any]:
-    """Reduce an OPS search response to identifiers and pagination metadata."""
+    """Reduce an OPS search response to screenable hits and pagination metadata."""
     world = data.get("ops:world-patent-data", data.get("world-patent-data", {}))
     search = _ops_key(world, "biblio-search", {})
     search_result = _ops_key(search, "search-result", {})
-    references = _as_list(_ops_key(search_result, "publication-reference"))
+    # ``exchange-documents`` may be one wrapper or a list of wrappers, each
+    # holding one or more ``exchange-document`` entries.
+    exchange_documents: list = []
+    for container in _as_list(_ops_key(search_result, "exchange-documents")):
+        exchange_documents.extend(_as_list(_ops_key(container, "exchange-document")))
+    if not exchange_documents:
+        # Some collections answer without the biblio constituent; fall back to
+        # bare publication references.
+        exchange_documents = _as_list(_ops_key(search_result, "publication-reference"))
 
     seen: set[str] = set()
     results: list[dict[str, str]] = []
-    for reference in references:
-        publication_number = _publication_number(reference)
+    for document in exchange_documents:
+        bibliographic_data = _ops_key(document, "bibliographic-data") or document
+        publication_number = _publication_number(bibliographic_data)
         if not publication_number or publication_number in seen:
             continue
         seen.add(publication_number)
-        results.append(
-            {
-                "publication_number": publication_number,
-                "google_patents_url": (
-                    f"https://patents.google.com/patent/{publication_number}/en"
-                ),
-            }
-        )
+        hit: dict[str, str] = {
+            "publication_number": publication_number,
+            "google_patents_url": (
+                f"https://patents.google.com/patent/{publication_number}/en"
+            ),
+        }
+        title = _search_hit_title(bibliographic_data)
+        if title:
+            hit["title"] = title
+        if abstract_chars > 0:
+            abstract = _snippet(_search_hit_abstract(document), abstract_chars)
+            if abstract:
+                hit["abstract"] = abstract
+        results.append(hit)
         if len(results) >= min(requested_limit, MAX_SEARCH_RESULTS):
             break
+    references = exchange_documents
 
     try:
         total = int(search.get("@total-result-count", len(results)))
@@ -449,10 +537,10 @@ def compact_search_response(
         "deduplication": "publication_number",
         "results": results,
         "note": (
-            "Use get_patent_biblio only for shortlisted identifiers; search output "
-            "intentionally omits raw OPS payloads. OPS may return any member of a "
-            "pertinent family; retain the hit and resolve a convenient-language "
-            "equivalent during verification."
+            "Screen hits from the title and abstract excerpt; use get_patent_biblio "
+            "only for shortlisted identifiers (full record, citations, family). OPS "
+            "may return any member of a pertinent family; retain the hit and resolve "
+            "a convenient-language equivalent during verification."
         ),
     }
     if end < total:
@@ -504,7 +592,12 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="get_patent_biblio",
-            description="Retrieve bibliographic data for a patent publication (title, inventors, applicants, dates, etc.)",
+            description=(
+                "Retrieve bibliographic data for a patent publication: title, abstract, "
+                "inventors, applicants, dates, CPC/IPC classifications, INPADOC family id, "
+                "and cited documents with search-report categories (X/Y citations are "
+                "examiner-flagged prior-art leads worth harvesting)."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -606,13 +699,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_patents",
-            description="Search EPO OPS bibliographic data and title/abstract text using Espacenet CQL; this is not a claims or description full-text search. Returns compact publication identifiers with pagination metadata. Use pa= for applicant, in= for inventor, parenthesise mixed AND/OR expressions, and use get_patent_biblio for a known publication number.",
+            description="Search EPO OPS bibliographic data and title/abstract text using Espacenet CQL; this is not a claims or description full-text search. Returns compact hits with title and a bounded abstract excerpt for screening, plus pagination metadata. Supports keyword-free classification intersection (cpc=X and cpc=Y) and citation queries (ct=). Use pa= for applicant, in= for inventor, parenthesise mixed AND/OR expressions, and use get_patent_biblio for a known publication number.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Espacenet CQL query, e.g. 'cpc=H04L9/32 and ta=authentication' or '(pa=prophesee or pa=omnivision) and (ta=event or ta=frame)'"
+                        "description": "Espacenet CQL query, e.g. 'cpc=H04L9/32 and ta=authentication', 'cpc=G01J1/44 and cpc=G01S7/486', or 'ct=EP1000000'"
                     },
                     "start": {
                         "type": "integer",
@@ -671,6 +764,13 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "default": True,
                         "description": "Include parent classes up to the CPC section"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_CPC_RESULTS,
+                        "default": DEFAULT_CPC_HIERARCHY_RESULTS,
+                        "description": "Maximum compact hierarchy records to return (1-20)"
                     }
                 },
                 "required": ["symbol"]
@@ -745,15 +845,19 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 symbol = re.sub(r"\s+", "", str(arguments.get("symbol", ""))).upper()
                 depth = int(arguments.get("depth", 1))
                 include_ancestors = bool(arguments.get("include_ancestors", True))
+                limit = int(arguments.get("limit", DEFAULT_CPC_HIERARCHY_RESULTS))
                 if not re.fullmatch(r"[A-HY]\d{2}[A-Z](?:\d+(?:/\d+)?)?", symbol):
                     raise ValueError("symbol must be a CPC symbol such as H04L9/32")
                 if not 0 <= depth <= 5:
                     raise ValueError("depth must be between 0 and 5")
+                if not 1 <= limit <= MAX_CPC_RESULTS:
+                    raise ValueError(f"limit must be between 1 and {MAX_CPC_RESULTS}")
                 records = parse_cpc_xml(await fetch_cpc_hierarchy(client, symbol, depth, include_ancestors))
                 payload = {
                     "requested_symbol": symbol,
-                    "returned": min(len(records), MAX_CPC_RESULTS),
-                    "classes": records[:MAX_CPC_RESULTS],
+                    "returned": min(len(records), limit),
+                    "total_available": len(records),
+                    "classes": records[:limit],
                 }
                 return [TextContent(
                     type="text",
@@ -852,7 +956,20 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     raise ValueError("context_chars must be between 0 and 1000")
 
                 # Get description
-                description_xml = await fetch_description(client, pub_info)
+                try:
+                    description_xml = await fetch_description(client, pub_info)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        google_patents_url = f"https://patents.google.com/patent/{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}/en"
+                        return [TextContent(
+                            type="text",
+                            text=f"Description text not available for {pub_num} via EPO OPS API "
+                                 f"(common for US publications), so it cannot be searched here.\n\n"
+                                 f"Use bounded web extraction on Google Patents instead and look "
+                                 f"for the passage there:\n"
+                                 f"Fetch {google_patents_url}"
+                        )]
+                    raise
                 parsed = parse_description_xml(description_xml)
                 
                 # Search for text in paragraphs
@@ -971,10 +1088,24 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     text=f"Error: HTTP {e.response.status_code} - {e.response.text}"
                 )]
         
-        except Exception as e:
+        except httpx.TimeoutException:
             return [TextContent(
                 type="text",
-                text=f"Error: {str(e)}"
+                text=json.dumps({
+                    "error": {
+                        "type": "timeout",
+                        "tool": name,
+                        "retryable": True,
+                        "message": "EPO OPS request timed out after 30 seconds; retry this call once.",
+                    }
+                })
+            )]
+
+        except Exception as e:
+            detail = str(e).strip() or type(e).__name__
+            return [TextContent(
+                type="text",
+                text=f"Error: {detail}"
             )]
 
 

@@ -170,30 +170,45 @@ def format_description_for_display(desc_data: Dict[str, Any]) -> str:
     return "\n".join(output)
 
 
+def _as_list(value: Any) -> list:
+    """Normalise OPS JSON values that may be a single object or a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
 def parse_biblio_json(biblio_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract key bibliographic fields from EPO OPS JSON response.
-    
+
     Returns simplified dictionary with:
     - publication_number, publication_date, publication_kind
     - application_number, application_date
-    - title
+    - title, abstract
     - inventors
     - applicants
-    - ipc_classifications
+    - ipc and cpc classifications
     - priorities
+    - cited_documents (search-report/applicant citations with categories) and cited_npl
+    - family_id
     """
     result = {
         "publication": {},
         "application": {},
         "title": "",
+        "abstract": "",
         "inventors": [],
         "applicants": [],
         "classifications": {
             "ipc": [],
             "cpc": []
         },
-        "priorities": []
+        "priorities": [],
+        "cited_documents": [],
+        "cited_npl": [],
+        "family_id": ""
     }
     
     try:
@@ -212,7 +227,26 @@ def parse_biblio_json(biblio_json: Dict[str, Any]) -> Dict[str, Any]:
         
         # Bibliographic data
         biblio_data = exchange_doc.get("bibliographic-data", {})
-        
+
+        # INPADOC family identifier (exchange-document attribute)
+        result["family_id"] = str(exchange_doc.get("@family-id", "") or "")
+
+        # Abstract (exchange-document level; prefer English)
+        abstracts = _as_list(exchange_doc.get("abstract"))
+        chosen_abstract = None
+        for abstract in abstracts:
+            if isinstance(abstract, dict) and abstract.get("@lang") == "en":
+                chosen_abstract = abstract
+                break
+        if chosen_abstract is None and abstracts:
+            chosen_abstract = abstracts[0]
+        if isinstance(chosen_abstract, dict):
+            paragraphs = [
+                p.get("$", "") if isinstance(p, dict) else str(p)
+                for p in _as_list(chosen_abstract.get("p"))
+            ]
+            result["abstract"] = " ".join(part.strip() for part in paragraphs if part).strip()
+
         # Publication reference
         pub_ref = biblio_data.get("publication-reference", {})
         if pub_ref:
@@ -296,7 +330,74 @@ def parse_biblio_json(biblio_json: Dict[str, Any]) -> Dict[str, Any]:
             ])
             if ipc_class != "/":
                 result["classifications"]["ipc"].append(ipc_class)
-        
+
+        # CPC (and other scheme) classifications
+        patent_classifications = _as_list(
+            biblio_data.get("patent-classifications", {}).get("patent-classification")
+        )
+        for cls in patent_classifications:
+            if not isinstance(cls, dict):
+                continue
+            scheme = ""
+            scheme_info = cls.get("classification-scheme")
+            if isinstance(scheme_info, dict):
+                scheme = str(scheme_info.get("@scheme", "") or "")
+            if scheme and not scheme.upper().startswith("CPC"):
+                continue
+            text_value = cls.get("text")
+            if isinstance(text_value, dict) and text_value.get("$"):
+                symbol = str(text_value["$"]).strip()
+            else:
+                parts = [
+                    cls.get(key, {}).get("$", "") if isinstance(cls.get(key), dict) else ""
+                    for key in ("section", "class", "subclass", "main-group", "subgroup")
+                ]
+                symbol = "".join(parts[:4])
+                if parts[4]:
+                    symbol = f"{symbol}/{parts[4]}"
+            if symbol and symbol != "/" and symbol not in result["classifications"]["cpc"]:
+                result["classifications"]["cpc"].append(symbol)
+
+        # Cited documents (search report and applicant citations)
+        citations = _as_list(biblio_data.get("references-cited", {}).get("citation"))
+        for citation in citations:
+            if not isinstance(citation, dict):
+                continue
+            categories = [
+                cat.get("$", "") if isinstance(cat, dict) else str(cat)
+                for cat in _as_list(citation.get("category"))
+            ]
+            category = " ".join(part for part in categories if part)
+            phase = str(citation.get("@cited-phase", "") or "")
+            if phase.lower() == "undefined":
+                phase = ""
+            patcit = citation.get("patcit")
+            if isinstance(patcit, dict):
+                number = ""
+                for doc_id in _as_list(patcit.get("document-id")):
+                    if not isinstance(doc_id, dict):
+                        continue
+                    if doc_id.get("@document-id-type") == "docdb":
+                        number = "".join(
+                            doc_id.get(key, {}).get("$", "") if isinstance(doc_id.get(key), dict) else ""
+                            for key in ("country", "doc-number", "kind")
+                        )
+                        break
+                if number:
+                    result["cited_documents"].append(
+                        {"number": number, "category": category, "phase": phase}
+                    )
+                continue
+            nplcit = citation.get("nplcit")
+            if isinstance(nplcit, dict):
+                text_value = nplcit.get("text")
+                text = text_value.get("$", "") if isinstance(text_value, dict) else str(text_value or "")
+                text = " ".join(text.split()).lstrip("- ")
+                if text:
+                    if len(text) > 300:
+                        text = text[:297] + "..."
+                    result["cited_npl"].append({"text": text, "category": category})
+
         # Priority data
         priorities = biblio_data.get("priority-claims", {}).get("priority-claim", [])
         if not isinstance(priorities, list):
@@ -346,7 +447,13 @@ def format_biblio_for_display(biblio_data: Dict[str, Any]) -> str:
         output.append("Title:")
         output.append(f"  {biblio_data['title']}")
         output.append("")
-    
+
+    # Abstract
+    if biblio_data.get("abstract"):
+        output.append("Abstract:")
+        output.append(f"  {biblio_data['abstract']}")
+        output.append("")
+
     # Inventors
     if biblio_data.get("inventors"):
         output.append("Inventors:")
@@ -363,19 +470,51 @@ def format_biblio_for_display(biblio_data: Dict[str, Any]) -> str:
     
     # Classifications
     classifications = biblio_data.get("classifications", {})
+    if classifications.get("cpc"):
+        output.append("CPC Classifications:")
+        for cpc in classifications["cpc"]:
+            output.append(f"  - {cpc}")
+        output.append("")
     if classifications.get("ipc"):
         output.append("IPC Classifications:")
         for ipc in classifications["ipc"]:
             output.append(f"  - {ipc}")
         output.append("")
-    
+
     # Priorities
     if biblio_data.get("priorities"):
         output.append("Priority Claims:")
         for prio in biblio_data["priorities"]:
             output.append(f"  - {prio.get('country')}{prio.get('number')} ({prio.get('date', 'N/A')})")
         output.append("")
-    
+
+    # Cited documents (from search report or applicant)
+    if biblio_data.get("cited_documents"):
+        output.append("Cited Documents:")
+        for cited in biblio_data["cited_documents"]:
+            marker = f" [{cited['category']}]" if cited.get("category") else ""
+            phase = f" ({cited['phase']})" if cited.get("phase") else ""
+            output.append(f"  - {cited['number']}{marker}{phase}")
+        if any(cited.get("category") for cited in biblio_data["cited_documents"]):
+            output.append(
+                "  Categories: X = particularly relevant alone; Y = relevant combined; "
+                "A = background. X/Y citations are strong prior-art leads."
+            )
+        output.append("")
+
+    # Cited non-patent literature
+    if biblio_data.get("cited_npl"):
+        output.append("Cited Non-Patent Literature:")
+        for npl in biblio_data["cited_npl"]:
+            marker = f" [{npl['category']}]" if npl.get("category") else ""
+            output.append(f"  - {npl['text']}{marker}")
+        output.append("")
+
+    # Family
+    if biblio_data.get("family_id"):
+        output.append(f"INPADOC Family ID: {biblio_data['family_id']}")
+        output.append("")
+
     if biblio_data.get("parsing_error"):
         output.append(f"\nNote: Parsing error occurred: {biblio_data['parsing_error']}")
     
