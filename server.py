@@ -14,9 +14,14 @@ The server handles publication numbers in various formats commonly cited in offi
 """
 
 import asyncio
+from html import unescape
 import json
 import os
 import re
+import shutil
+import tempfile
+from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
@@ -50,7 +55,7 @@ OPS_AUTH_URL = "https://ops.epo.org/3.2/auth/accesstoken"
 access_token: str | None = None
 token_expiry: float = 0
 
-DEFAULT_SEARCH_RESULTS = 25
+DEFAULT_SEARCH_RESULTS = 10
 MAX_SEARCH_RESULTS = 100
 # Abstract excerpt length per search hit; bounds screening cost to roughly
 # 75 tokens per result while keeping the device-and-elements opening sentences.
@@ -61,6 +66,247 @@ MAX_CPC_TITLE_CHARS = 240
 DEFAULT_EXCERPT_CONTEXT_CHARS = 300
 MAX_EXCERPT_CONTEXT_CHARS = 1000
 MAX_EXCERPT_MATCHES = 10
+DEFAULT_FULLTEXT_RESULTS = 10
+MAX_FULLTEXT_RESULTS = 10
+USPTO_PDF_BASE_URL = "https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf"
+USPTO_OCR_CONCURRENCY = 4
+
+
+class GooglePatentDescriptionParser(HTMLParser):
+    """Collect visible text only from Google Patents' description section."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._stack: list[tuple[str, bool]] = []
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {key.lower(): value or "" for key, value in attrs}
+        in_description = (
+            (self._stack[-1][1] if self._stack else False)
+            or (tag.lower() == "section" and attributes.get("itemprop", "").lower() == "description")
+        )
+        self._stack.append((tag.lower(), in_description))
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for index in range(len(self._stack) - 1, -1, -1):
+            if self._stack[index][0] == tag:
+                del self._stack[index:]
+                break
+
+    def handle_data(self, data: str) -> None:
+        if self._stack and self._stack[-1][1] and data.strip():
+            self.parts.append(data)
+
+
+async def fetch_google_patent_description(
+    client: httpx.AsyncClient, pub_info: dict[str, str]
+) -> tuple[str, str]:
+    """Fetch and parse full description text for targeted local phrase search."""
+    publication = f"{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}"
+    url = f"https://patents.google.com/patent/{publication}/en"
+    response = await client.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 HermesEspacenetMCP/1.0",
+            "Accept": "text/html,*/*;q=0.8",
+        },
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+    parser = GooglePatentDescriptionParser()
+    parser.feed(response.text)
+    description = " ".join(" ".join(parser.parts).split())
+    if not description:
+        raise ValueError("Google Patents returned no description text")
+    return description, url
+
+
+def isolate_uspto_description(ocr_text: str) -> str:
+    """Keep the specification body from an OCRed US publication, excluding claims."""
+    text = re.sub(r"(?<=\w)-\s*\n\s*(?=\w)", "", ocr_text)
+    text = text.replace("\r", "")
+    heading = re.search(
+        r"(?im)^\s*(?:CROSS[- ]REFERENCE TO RELATED APPLICATIONS|"
+        r"FIELD OF (?:THE )?(?:DISCLOSURE|INVENTION)|TECHNICAL FIELD|"
+        r"BACKGROUND(?: INFORMATION| OF THE INVENTION)?|SUMMARY(?: OF THE INVENTION)?)\s*$",
+        text,
+    )
+    if not heading:
+        raise ValueError("could not isolate the description in the USPTO publication PDF")
+    description = text[heading.start():]
+    claim_markers = [
+        r"(?im)^\s*WHAT IS CLAIMED(?: IS)?:?\s*$",
+        r"(?im)^\s*THE INVENTION CLAIMED IS:?\s*$",
+        r"(?im)^\s*CLAIMS\s*$",
+        r"(?i)\bthe terms used in\s+the following claims\b",
+    ]
+    cut_positions = []
+    for marker in claim_markers:
+        match = re.search(marker, description)
+        if match:
+            cut_positions.append(match.start())
+    if cut_positions:
+        description = description[:min(cut_positions)]
+    description = " ".join(description.split())
+    if len(description) < 200:
+        raise ValueError("USPTO OCR returned no usable description text")
+    return description
+
+
+async def _run_process(*command: str, timeout: float = 90) -> tuple[bytes, bytes]:
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError:
+        process.kill()
+        await process.communicate()
+        raise RuntimeError(f"Timed out running {Path(command[0]).name}")
+    if process.returncode:
+        detail = stderr.decode("utf-8", errors="replace").strip()[-500:]
+        raise RuntimeError(f"{Path(command[0]).name} failed: {detail}")
+    return stdout, stderr
+
+
+async def fetch_uspto_pdf_description(
+    client: httpx.AsyncClient, pub_info: dict[str, str]
+) -> tuple[str, str]:
+    """OCR the official US publication PDF and return its description only."""
+    if pub_info.get("country") != "US":
+        raise ValueError("USPTO publication PDF fallback is available only for US publications")
+    pdftoppm = shutil.which("pdftoppm")
+    tesseract = shutil.which("tesseract")
+    if not pdftoppm or not tesseract:
+        raise RuntimeError("USPTO PDF OCR requires pdftoppm and tesseract")
+
+    document_number = pub_info["doc_number_full"]
+    url = f"{USPTO_PDF_BASE_URL}/{document_number}"
+    response = await client.get(
+        url,
+        headers={"User-Agent": "HermesEspacenetMCP/1.0", "Accept": "application/pdf"},
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+    if not response.content.startswith(b"%PDF"):
+        raise ValueError("USPTO publication endpoint did not return a PDF")
+
+    with tempfile.TemporaryDirectory(prefix="espacenet-uspto-") as directory:
+        workdir = Path(directory)
+        pdf_path = workdir / "publication.pdf"
+        pdf_path.write_bytes(response.content)
+        page_prefix = workdir / "page"
+        await _run_process(
+            pdftoppm,
+            "-jpeg",
+            "-r",
+            "150",
+            str(pdf_path),
+            str(page_prefix),
+            timeout=90,
+        )
+        pages = sorted(workdir.glob("page-*.jpg"))
+        if not pages:
+            raise ValueError("USPTO publication PDF rendered no pages")
+        semaphore = asyncio.Semaphore(USPTO_OCR_CONCURRENCY)
+
+        async def ocr_page(page: Path) -> str:
+            async with semaphore:
+                stdout, _ = await _run_process(
+                    tesseract,
+                    str(page),
+                    "stdout",
+                    "-l",
+                    "eng",
+                    "--psm",
+                    "3",
+                    timeout=60,
+                )
+                return stdout.decode("utf-8", errors="replace")
+
+        page_text = await asyncio.gather(*(ocr_page(page) for page in pages))
+    return isolate_uspto_description("\n".join(page_text)), url
+
+
+def _google_fulltext_query(query: str) -> str:
+    """Quote hyphenated concepts while preserving a compact all-term query."""
+    terms = re.findall(r'"[^"]+"|\S+', " ".join(query.split()))
+    normalized = [
+        term if term.startswith('"') or "-" not in term else f'"{term}"'
+        for term in terms
+    ]
+    return "+".join(normalized)
+
+
+async def search_google_patents_fulltext(
+    client: httpx.AsyncClient, query: str
+) -> dict[str, Any]:
+    encoded_query = quote(_google_fulltext_query(query), safe="+")
+    response = await client.get(
+        "https://patents.google.com/xhr/query",
+        params={"url": f"q={encoded_query}", "exp": ""},
+        headers={
+            "User-Agent": "Mozilla/5.0 HermesEspacenetMCP/1.0",
+            "Accept": "application/json",
+        },
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def compact_google_fulltext_response(
+    data: dict[str, Any], query: str, limit: int
+) -> dict[str, Any]:
+    results_block = data.get("results", {}) if isinstance(data, dict) else {}
+    compact: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for cluster in results_block.get("cluster", []) or []:
+        for item in cluster.get("result", []) or []:
+            patent = item.get("patent", {}) if isinstance(item, dict) else {}
+            publication = re.sub(
+                r"[^A-Z0-9]", "", str(patent.get("publication_number", "")).upper()
+            )
+            if not publication or publication in seen:
+                continue
+            seen.add(publication)
+            title = " ".join(
+                unescape(re.sub(r"<[^>]+>", " ", str(patent.get("title", "")))).split()
+            )
+            snippet = " ".join(
+                unescape(re.sub(r"<[^>]+>", " ", str(patent.get("snippet", "")))).split()
+            )
+            compact.append(
+                {
+                    "publication_number": publication,
+                    "title": title,
+                    "snippet": snippet[:500],
+                    "priority_date": str(patent.get("priority_date", "")),
+                    "publication_date": str(patent.get("publication_date", "")),
+                    "inventor": str(patent.get("inventor", "")),
+                    "assignee": str(patent.get("assignee", "")),
+                    "url": f"https://patents.google.com/patent/{publication}/en",
+                }
+            )
+            if len(compact) >= limit:
+                break
+        if len(compact) >= limit:
+            break
+    return {
+        "query": query,
+        "source": "google_patents_fulltext",
+        "total_results": int(results_block.get("total_num_results", 0) or 0),
+        "returned": len(compact),
+        "results": compact,
+        "note": (
+            "Full-text discovery leads only. Shortlist by technical relevance, then use "
+            "get_patent_biblio and description evidence; do not retrieve claims."
+        ),
+    }
 
 
 def _is_us_pregrant(country: str, number: str, kind: str) -> bool:
@@ -566,20 +812,68 @@ def no_search_results_response(
     }
 
 
-def excerpt_around(text: str, needle: str, context_chars: int) -> str:
-    """Return a bounded excerpt centred on a case-insensitive literal match."""
+def literal_match_span(text: str, needle: str) -> tuple[int, int] | None:
+    """Find a case-insensitive literal phrase without matching inside a word."""
     normalized_text = " ".join(text.split())
     normalized_needle = " ".join(needle.split())
-    index = normalized_text.lower().find(normalized_needle.lower())
-    if index < 0:
+    if not normalized_needle:
+        return None
+    escaped = re.escape(normalized_needle)
+    prefix = r"(?<!\w)" if normalized_needle[0].isalnum() else ""
+    suffix = r"(?!\w)" if normalized_needle[-1].isalnum() else ""
+    match = re.search(prefix + escaped + suffix, normalized_text, re.IGNORECASE)
+    return match.span() if match else None
+
+
+def excerpt_around(text: str, needle: str, context_chars: int) -> str:
+    """Return a bounded excerpt centred on a word-bounded literal match."""
+    normalized_text = " ".join(text.split())
+    span = literal_match_span(normalized_text, needle)
+    if span is None:
         return normalized_text[: context_chars * 2]
+    index, match_end = span
     start = max(0, index - context_chars)
-    end = min(
-        len(normalized_text), index + len(normalized_needle) + context_chars
-    )
+    end = min(len(normalized_text), match_end + context_chars)
     prefix = "…" if start else ""
     suffix = "…" if end < len(normalized_text) else ""
     return f"{prefix}{normalized_text[start:end]}{suffix}"
+
+
+def literal_excerpt_matches(
+    text: str, needle: str, context_chars: int, max_matches: int
+) -> list[str]:
+    """Return bounded excerpts for successive word-bounded literal matches."""
+    remaining = " ".join(text.split())
+    excerpts: list[str] = []
+    while remaining and len(excerpts) < max_matches:
+        span = literal_match_span(remaining, needle)
+        if span is None:
+            break
+        excerpts.append(excerpt_around(remaining, needle, context_chars))
+        remaining = remaining[max(span[1], 1) :]
+    return excerpts
+
+
+def individual_term_excerpt_matches(
+    text: str, query: str, context_chars: int, max_matches: int
+) -> tuple[list[dict[str, str]], dict[str, int]]:
+    """Fall back from a non-contiguous keyword bag to bounded per-term evidence."""
+    terms: list[str] = []
+    for term in re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", query):
+        if len(term) >= 3 and term.lower() not in {item.lower() for item in terms}:
+            terms.append(term)
+    matches: list[dict[str, str]] = []
+    counts: dict[str, int] = {}
+    normalized = " ".join(text.split())
+    for term in terms:
+        pattern = re.compile(r"(?<!\w)" + re.escape(term) + r"(?!\w)", re.IGNORECASE)
+        count = len(pattern.findall(normalized))
+        counts[term] = count
+        if count and len(matches) < max_matches:
+            matches.append(
+                {"term": term, "excerpt": excerpt_around(normalized, term, context_chars)}
+            )
+    return matches, counts
 
 
 # Create MCP server instance
@@ -698,6 +992,31 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="search_patent_fulltext",
+            description=(
+                "Search indexed Google Patents full text and return compact patent leads. "
+                "Use as a bounded fallback when ordinary web discovery misses description-only "
+                "terminology. This is independent of OPS and does not search or return claims."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Short technical query using relationship and function terms, without party names"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_FULLTEXT_RESULTS,
+                        "default": DEFAULT_FULLTEXT_RESULTS,
+                        "description": "Maximum compact full-text leads to return (1-10)"
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        Tool(
             name="search_patents",
             description="Search EPO OPS bibliographic data and title/abstract text using Espacenet CQL; this is not a claims or description full-text search. Returns compact hits with title and a bounded abstract excerpt for screening, plus pagination metadata. Supports keyword-free classification intersection (cpc=X and cpc=Y) and citation queries (ct=). Use pa= for applicant, in= for inventor, parenthesise mixed AND/OR expressions, and use get_patent_biblio for a known publication number.",
             inputSchema={
@@ -783,7 +1102,7 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     """Handle tool calls."""
     
-    if not OPS_CONSUMER_KEY or not OPS_CONSUMER_SECRET:
+    if name != "search_patent_fulltext" and (not OPS_CONSUMER_KEY or not OPS_CONSUMER_SECRET):
         raise ValueError(
             "EPO OPS credentials not configured. "
             "Set OPS_CONSUMER_KEY and OPS_CONSUMER_SECRET environment variables."
@@ -791,6 +1110,25 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
+            if name == "search_patent_fulltext":
+                query = str(arguments.get("query", "")).strip()
+                requested_limit = int(arguments.get("limit", DEFAULT_FULLTEXT_RESULTS))
+                if not query:
+                    raise ValueError("query is required")
+                if not 1 <= requested_limit <= MAX_FULLTEXT_RESULTS:
+                    raise ValueError(
+                        f"limit must be between 1 and {MAX_FULLTEXT_RESULTS}"
+                    )
+                payload = compact_google_fulltext_response(
+                    await search_google_patents_fulltext(client, query),
+                    query,
+                    requested_limit,
+                )
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False),
+                )]
+
             if name == "search_patents":
                 query = str(arguments.get("query", "")).strip()
                 start = int(arguments.get("start", 1))
@@ -960,37 +1298,100 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     description_xml = await fetch_description(client, pub_info)
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
-                        google_patents_url = f"https://patents.google.com/patent/{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}/en"
+                        source = "google_patents_description_fallback"
+                        try:
+                            description, source_url = await fetch_google_patent_description(
+                                client, pub_info
+                            )
+                        except Exception as google_error:
+                            try:
+                                description, source_url = await fetch_uspto_pdf_description(
+                                    client, pub_info
+                                )
+                                source = "uspto_publication_pdf_ocr_fallback"
+                            except Exception as uspto_error:
+                                google_patents_url = f"https://patents.google.com/patent/{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}/en"
+                                return [TextContent(
+                                    type="text",
+                                    text=f"Description text not available for {pub_num} via EPO OPS API. "
+                                         f"Google Patents fallback failed: {google_error}. "
+                                         f"Official USPTO PDF fallback failed: {uspto_error}.\n"
+                                         f"Fetch {google_patents_url}#description"
+                                )]
+                        excerpts = literal_excerpt_matches(
+                            description, search_text, context_chars, max_matches
+                        )
+                        term_matches: list[dict[str, str]] = []
+                        term_counts: dict[str, int] = {}
+                        match_mode = "exact_phrase"
+                        if not excerpts and len(search_text.split()) > 1:
+                            term_matches, term_counts = individual_term_excerpt_matches(
+                                description, search_text, context_chars, max_matches
+                            )
+                            match_mode = "individual_terms"
+                        serialized_matches = (
+                            [
+                                {"section": "Description", "excerpt": excerpt}
+                                for excerpt in excerpts
+                            ]
+                            if excerpts
+                            else [
+                                {
+                                    "section": "Description",
+                                    "term": match["term"],
+                                    "excerpt": match["excerpt"],
+                                }
+                                for match in term_matches
+                            ]
+                        )
                         return [TextContent(
                             type="text",
-                            text=f"Description text not available for {pub_num} via EPO OPS API "
-                                 f"(common for US publications), so it cannot be searched here.\n\n"
-                                 f"Use bounded web extraction on Google Patents instead and look "
-                                 f"for the passage there:\n"
-                                 f"Fetch {google_patents_url}"
+                            text=json.dumps(
+                                {
+                                    "publication_number": str(pub_num),
+                                    "search_text": str(search_text),
+                                    "source": source,
+                                    "source_url": source_url + (
+                                        "#description" if source == "google_patents_description_fallback" else ""
+                                    ),
+                                    "match_mode": match_mode,
+                                    "term_counts": term_counts,
+                                    "returned": len(serialized_matches),
+                                    "matches": serialized_matches,
+                                },
+                                ensure_ascii=False,
+                            )
                         )]
                     raise
                 parsed = parse_description_xml(description_xml)
-                
-                # Search for text in paragraphs
-                search_normalized = " ".join(search_text.lower().split())
-                matches = []
-                
-                for section in parsed.get("sections", []):
-                    for i, para in enumerate(section.get("paragraphs", [])):
-                        para_normalized = " ".join(para.lower().split())
-                        if search_normalized in para_normalized:
-                            matches.append({
-                                "section": section.get("heading", "Unknown section"),
-                                "paragraph_index": i,
-                                "excerpt": excerpt_around(
-                                    para, str(search_text), context_chars
-                                ),
-                            })
-                            if len(matches) >= max_matches:
-                                break
-                    if len(matches) >= max_matches:
-                        break
+                description = "\n".join(
+                    para
+                    for section in parsed.get("sections", [])
+                    for para in section.get("paragraphs", [])
+                )
+                excerpts = literal_excerpt_matches(
+                    description, search_text, context_chars, max_matches
+                )
+                term_matches: list[dict[str, str]] = []
+                term_counts: dict[str, int] = {}
+                match_mode = "exact_phrase"
+                if not excerpts and len(search_text.split()) > 1:
+                    term_matches, term_counts = individual_term_excerpt_matches(
+                        description, search_text, context_chars, max_matches
+                    )
+                    match_mode = "individual_terms"
+                matches = (
+                    [{"section": "Description", "excerpt": excerpt} for excerpt in excerpts]
+                    if excerpts
+                    else [
+                        {
+                            "section": "Description",
+                            "term": match["term"],
+                            "excerpt": match["excerpt"],
+                        }
+                        for match in term_matches
+                    ]
+                )
                 
                 if not matches:
                     return [TextContent(
@@ -1001,9 +1402,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                                 "search_text": str(search_text),
                                 "returned": 0,
                                 "matches": [],
+                                "term_counts": term_counts,
                                 "note": (
-                                    "The text may be paraphrased or may occur in "
-                                    "the claims instead of the description."
+                                    "No literal description match. Try one paraphrase or "
+                                    "retrieve a bounded description window; do not retrieve claims."
                                 ),
                             },
                             ensure_ascii=False,
@@ -1016,6 +1418,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                         {
                             "publication_number": str(pub_num),
                             "search_text": str(search_text),
+                            "source": "epo_ops_description",
+                            "match_mode": match_mode,
+                            "term_counts": term_counts,
                             "returned": len(matches),
                             "matches": matches,
                         },

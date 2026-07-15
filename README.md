@@ -27,8 +27,10 @@ member during discovery and resolve a convenient-language equivalent during veri
 Ambiguous aliases such as `an=` and `applicant=` are rejected with guidance. Use `pa=` for applicant,
 `in=` for inventor, and `get_patent_biblio` for a known publication number.
 
-`find_text_in_patent` returns bounded excerpts (five by default) instead of complete neighbouring
-paragraphs. This is the preferred screening tool before requesting full claims or descriptions.
+`find_text_in_patent` searches descriptions only and returns bounded excerpts (five by default), never
+claims or a complete specification. If OPS lacks description text it tries Google Patents, then for US
+publications the official USPTO publication PDF with local OCR (`pdftoppm` and `tesseract`).
+This is the preferred screening tool for technical disclosure in prior-art work.
 OPS 404 search responses are normalized to an empty result set without replaying the XML fault body.
 
 ## Quick Start
