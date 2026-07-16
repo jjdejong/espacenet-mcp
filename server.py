@@ -1014,6 +1014,32 @@ def excerpt_around(text: str, needle: str, context_chars: int) -> str:
     return f"{prefix}{normalized_text[start:end]}{suffix}"
 
 
+def individual_term_pattern(term: str) -> re.Pattern[str]:
+    """Match a keyword as a word, including its simple singular/plural form."""
+    escaped = re.escape(term)
+    if term.lower().endswith("s") and len(term) > 3:
+        escaped = re.escape(term[:-1]) + "s?"
+    elif len(term) > 3:
+        escaped += "s?"
+    return re.compile(r"(?<!\w)" + escaped + r"(?!\w)", re.IGNORECASE)
+
+
+def excerpt_around_individual_term(
+    text: str, term: str, context_chars: int, *, last: bool = False
+) -> str:
+    """Return context around the first or last singular/plural keyword match."""
+    normalized_text = " ".join(text.split())
+    matches = list(individual_term_pattern(term).finditer(normalized_text))
+    if not matches:
+        return normalized_text[: context_chars * 2]
+    match = matches[-1] if last else matches[0]
+    start = max(0, match.start() - context_chars)
+    end = min(len(normalized_text), match.end() + context_chars)
+    prefix = "…" if start else ""
+    suffix = "…" if end < len(normalized_text) else ""
+    return f"{prefix}{normalized_text[start:end]}{suffix}"
+
+
 def literal_excerpt_matches(
     text: str, needle: str, context_chars: int, max_matches: int
 ) -> list[str]:
@@ -1030,24 +1056,80 @@ def literal_excerpt_matches(
 
 
 def individual_term_excerpt_matches(
-    text: str, query: str, context_chars: int, max_matches: int
+    text: str,
+    query: str,
+    context_chars: int,
+    max_matches: int,
+    priority_text: str = "",
 ) -> tuple[list[dict[str, str]], dict[str, int]]:
-    """Fall back from a non-contiguous keyword bag to bounded per-term evidence."""
+    """Fall back from a keyword bag, prioritising its rarer description terms."""
     terms: list[str] = []
     for term in re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", query):
         if len(term) >= 3 and term.lower() not in {item.lower() for item in terms}:
             terms.append(term)
-    matches: list[dict[str, str]] = []
     counts: dict[str, int] = {}
     normalized = " ".join(text.split())
     for term in terms:
-        pattern = re.compile(r"(?<!\w)" + re.escape(term) + r"(?!\w)", re.IGNORECASE)
-        count = len(pattern.findall(normalized))
-        counts[term] = count
-        if count and len(matches) < max_matches:
+        pattern = individual_term_pattern(term)
+        counts[term] = len(pattern.findall(normalized))
+
+    # Query bags commonly begin with broad capability words (for example,
+    # "image", "sensor", or "control"). Returning matches in query order lets
+    # those words consume the bounded excerpt budget before a rare structural or
+    # relational term is reached. Rarity within this candidate's description is
+    # a cheap, technology-neutral proxy for discriminative evidence.
+    query_order = {term: index for index, term in enumerate(terms)}
+    priority_terms = {
+        term.lower()
+        for term in re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", priority_text)
+    }
+    ranked_terms = sorted(
+        (term for term in terms if counts[term]),
+        key=lambda term: (
+            0 if term.lower() in priority_terms else 1,
+            counts[term],
+            query_order[term],
+        ),
+    )
+    prioritized = [term for term in ranked_terms if term.lower() in priority_terms]
+    ordinary = [term for term in ranked_terms if term.lower() not in priority_terms]
+    matches = [
+        {
+            "term": term,
+            "excerpt": excerpt_around_individual_term(
+                normalized, term, context_chars
+            ),
+        }
+        for term in prioritized[:max_matches]
+    ]
+    # When only one side of a requested relationship is named literally, keep a
+    # later occurrence too. Patent specifications often introduce a connection
+    # in a schematic paragraph and explain its physical operation in a later
+    # embodiment. This costs no fetch and avoids mistaking the first occurrence
+    # for the complete disclosure.
+    for term in prioritized:
+        if len(matches) >= max_matches:
+            break
+        if counts[term] > 1:
             matches.append(
-                {"term": term, "excerpt": excerpt_around(normalized, term, context_chars)}
+                {
+                    "term": term,
+                    "excerpt": excerpt_around_individual_term(
+                        normalized, term, context_chars, last=True
+                    ),
+                }
             )
+    for term in ordinary:
+        if len(matches) >= max_matches:
+            break
+        matches.append(
+            {
+                "term": term,
+                "excerpt": excerpt_around_individual_term(
+                    normalized, term, context_chars
+                ),
+            }
+        )
     return matches, counts
 
 
@@ -1056,6 +1138,7 @@ def description_evidence(
     search_text: str,
     context_chars: int,
     max_matches: int,
+    priority_text: str = "",
 ) -> dict[str, Any]:
     """Build the same bounded evidence shape for OPS, Google, or OCR text."""
     excerpts = literal_excerpt_matches(
@@ -1066,7 +1149,7 @@ def description_evidence(
     match_mode = "exact_phrase"
     if not excerpts and len(search_text.split()) > 1:
         term_matches, term_counts = individual_term_excerpt_matches(
-            description, search_text, context_chars, max_matches
+            description, search_text, context_chars, max_matches, priority_text
         )
         match_mode = "individual_terms"
     matches = (
@@ -1123,6 +1206,7 @@ async def build_shortlist_candidate_evidence(
 ) -> dict[str, Any]:
     publication_number = str(candidate.get("publication_number") or "").strip()
     search_text = str(candidate.get("search_text") or "").strip()
+    relationship_text = str(candidate.get("relationship_text") or "").strip()
     if not publication_number or not search_text:
         raise ValueError(
             "Each shortlist candidate requires publication_number and search_text"
@@ -1137,13 +1221,19 @@ async def build_shortlist_candidate_evidence(
         get_biblio(), get_description_text(client, pub_info)
     )
     description, source, source_url, cache_hit = description_result
+    evidence_query = " ".join(part for part in (relationship_text, search_text) if part)
     evidence = description_evidence(
-        description, search_text, context_chars, max_matches
+        description,
+        evidence_query,
+        context_chars,
+        max_matches,
+        priority_text=relationship_text,
     )
     evidence.update(
         {
             "publication_number": _publication_from_info(pub_info),
             "search_text": search_text,
+            "relationship_text": relationship_text,
             "source": source,
             "source_url": source_url + (
                 "#description"
@@ -1297,6 +1387,10 @@ async def list_tools() -> list[Tool]:
                                 "search_text": {
                                     "type": "string",
                                     "description": "Short phrase or keyword bag expressing the technical relationship to verify"
+                                },
+                                "relationship_text": {
+                                    "type": "string",
+                                    "description": "Optional source-derived relationship objects to prioritize within the candidate description; these are evidence terms, not database filters"
                                 }
                             },
                             "required": ["publication_number", "search_text"]

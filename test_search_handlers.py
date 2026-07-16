@@ -280,6 +280,8 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(shortlist_properties["candidates"]["maxItems"], 3)
         self.assertEqual(shortlist_properties["max_matches"]["maximum"], 5)
+        candidate_properties = shortlist_properties["candidates"]["items"]["properties"]
+        self.assertIn("relationship_text", candidate_properties)
 
     async def test_shortlist_verification_runs_three_candidates_in_parallel(self):
         running = 0
@@ -636,6 +638,79 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"match_mode": "individual_terms"', text)
         self.assertIn('"anode": 1', text)
         self.assertIn('"hole": 1', text)
+
+    def test_keyword_bag_prioritizes_rare_terms_over_common_leading_terms(self):
+        description = " ".join(
+            ["A sensor produces image and event data."] * 12
+            + [
+                "The uncommon terminal supplies a carrier current to the event path.",
+                "A second uncommon terminal is used for calibration.",
+            ]
+        )
+
+        matches, counts = server.individual_term_excerpt_matches(
+            description,
+            "sensor image event uncommon terminal carrier",
+            context_chars=80,
+            max_matches=3,
+        )
+
+        self.assertGreater(counts["sensor"], counts["carrier"])
+        self.assertEqual(
+            [match["term"] for match in matches],
+            ["carrier", "uncommon", "terminal"],
+        )
+
+    def test_explicit_relationship_terms_precede_even_rarer_generic_terms(self):
+        description = " ".join(
+            ["A sensor produces image and event data."] * 12
+            + ["A rare calibrator is present."]
+            + ["The lower electrode supplies the event path."] * 3
+        )
+
+        matches, _counts = server.individual_term_excerpt_matches(
+            description,
+            "sensor image event calibrator lower electrode",
+            context_chars=80,
+            max_matches=3,
+            priority_text="lower electrode",
+        )
+
+        self.assertEqual(
+            [match["term"] for match in matches],
+            ["lower", "electrode", "lower"],
+        )
+        self.assertIn("lower electrode", matches[2]["excerpt"].lower())
+
+    def test_repeated_relationship_term_includes_later_operating_passage(self):
+        description = (
+            "The terminal is connected in the schematic. "
+            + "Intermediate discussion. " * 80
+            + "During operation the terminal carries the measured output."
+        )
+
+        matches, _counts = server.individual_term_excerpt_matches(
+            description,
+            "sensor terminal",
+            context_chars=70,
+            max_matches=2,
+            priority_text="terminal",
+        )
+
+        self.assertEqual([match["term"] for match in matches], ["terminal", "terminal"])
+        self.assertIn("During operation", matches[1]["excerpt"])
+
+    def test_individual_term_matching_includes_simple_plural(self):
+        matches, counts = server.individual_term_excerpt_matches(
+            "One electrode is introduced. Later the electrodes carry hole current.",
+            "electrode",
+            context_chars=40,
+            max_matches=2,
+            priority_text="electrode",
+        )
+
+        self.assertEqual(counts["electrode"], 2)
+        self.assertIn("electrodes carry hole current", matches[1]["excerpt"])
 
     def test_excerpt_is_bounded_around_match(self):
         text = "a" * 500 + " event driven sensing " + "b" * 500
