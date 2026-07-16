@@ -15,9 +15,11 @@ The server handles publication numbers in various formats commonly cited in offi
 
 import asyncio
 import gzip
+from email.utils import parsedate_to_datetime
 from html import unescape
 import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -84,6 +86,94 @@ DESCRIPTION_CACHE_DIR = Path(
         os.getenv("ESPACENET_MCP_CACHE_DIR", "~/.cache/espacenet-mcp")
     )
 ) / "descriptions"
+
+# Google Patents has no official API and throttles bursty or bot-shaped
+# clients with 429/503 responses.  All requests to it share one paced lane
+# and a bounded Retry-After-aware retry schedule so a transient throttle
+# does not surface as a missing description.
+GOOGLE_PATENTS_MIN_INTERVAL = 3.0
+GOOGLE_PATENTS_INTERVAL_JITTER = 1.0
+GOOGLE_PATENTS_RETRY_DELAYS = (30.0, 120.0)
+GOOGLE_PATENTS_MAX_RETRY_AFTER = 180.0
+# Authorities whose OPS publications carry an English specification; family
+# members from these offices can stand in for a publication whose own text
+# is unavailable.
+ENGLISH_DESCRIPTION_AUTHORITIES = ("EP", "WO", "US", "GB", "CA", "AU")
+MAX_FAMILY_DESCRIPTION_ATTEMPTS = 3
+
+
+class RequestPacer:
+    """Serialize requests to one host with a minimum jittered interval."""
+
+    def __init__(self, min_interval: float, jitter: float) -> None:
+        self._min_interval = min_interval
+        self._jitter = jitter
+        self._lock = asyncio.Lock()
+        self._next_allowed = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_allowed - now)
+            self._next_allowed = (
+                max(now, self._next_allowed)
+                + self._min_interval
+                + random.uniform(0.0, self._jitter)
+            )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+google_patents_pacer = RequestPacer(
+    GOOGLE_PATENTS_MIN_INTERVAL, GOOGLE_PATENTS_INTERVAL_JITTER
+)
+
+
+def retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a Retry-After header as delay seconds or an HTTP date."""
+    value = str(response.headers.get("Retry-After") or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return float(value)
+    try:
+        target = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, target.timestamp() - time.time())
+
+
+async def google_patents_get(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+    accept: str,
+) -> httpx.Response:
+    """Paced GET against Google Patents with bounded throttle retries."""
+    for retry_delay in (*GOOGLE_PATENTS_RETRY_DELAYS, None):
+        await google_patents_pacer.wait()
+        response = await client.get(
+            url,
+            params=params,
+            headers={
+                "User-Agent": "Mozilla/5.0 HermesEspacenetMCP/1.0",
+                "Accept": accept,
+            },
+            follow_redirects=True,
+        )
+        if response.status_code in (429, 503) and retry_delay is not None:
+            server_delay = retry_after_seconds(response)
+            delay = (
+                retry_delay
+                if server_delay is None
+                else min(server_delay, GOOGLE_PATENTS_MAX_RETRY_AFTER)
+            )
+            await asyncio.sleep(delay)
+            continue
+        response.raise_for_status()
+        return response
+    raise RuntimeError("unreachable: retry loop always returns or raises")
 
 
 class GooglePatentDescriptionParser(HTMLParser):
@@ -172,15 +262,7 @@ async def fetch_google_patent_description(
     """Fetch and parse full description text for targeted local phrase search."""
     publication = f"{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}"
     url = f"https://patents.google.com/patent/{publication}/en"
-    response = await client.get(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 HermesEspacenetMCP/1.0",
-            "Accept": "text/html,*/*;q=0.8",
-        },
-        follow_redirects=True,
-    )
-    response.raise_for_status()
+    response = await google_patents_get(client, url, accept="text/html,*/*;q=0.8")
     parser = GooglePatentDescriptionParser()
     parser.feed(response.text)
     description = " ".join(" ".join(parser.parts).split())
@@ -298,6 +380,87 @@ async def fetch_uspto_pdf_description(
     return isolate_uspto_description("\n".join(page_text)), url
 
 
+def _description_text_from_xml(description_xml: str) -> str:
+    parsed = parse_description_xml(description_xml)
+    return "\n".join(
+        para
+        for section in parsed.get("sections", [])
+        for para in section.get("paragraphs", [])
+    )
+
+
+def _ops_description_url(pub_info: dict[str, str]) -> str:
+    return (
+        f"{OPS_BASE_URL}/published-data/publication/{pub_info['format']}/"
+        f"{pub_info['country']}.{pub_info['doc_number']}.{pub_info['kind']}/description"
+    )
+
+
+async def fetch_family_members(
+    client: httpx.AsyncClient, pub_info: dict[str, str]
+) -> list[dict[str, str]]:
+    """List INPADOC family members of a publication as parsed pub_info dicts."""
+    token = await get_access_token(client)
+    # The OPS family service resolves an epodoc reference without a kind code;
+    # including the kind can 404 even when the publication itself is known.
+    url = (
+        f"{OPS_BASE_URL}/family/publication/"
+        f"{pub_info['format']}/{pub_info['country']}.{pub_info['doc_number']}"
+    )
+    response = await client.get(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    family = _ops_key(
+        _ops_key(payload, "ops:world-patent-data", {}), "ops:patent-family", {}
+    )
+    members: list[dict[str, str]] = []
+    for member in _as_list(_ops_key(family, "ops:family-member", [])):
+        for reference in _as_list(_ops_key(member, "publication-reference", [])):
+            for document_id in _as_list(_ops_key(reference, "document-id", [])):
+                if _ops_key(document_id, "@document-id-type", "") != "docdb":
+                    continue
+                country = _ops_text(_ops_key(document_id, "country", ""))
+                number = _ops_text(_ops_key(document_id, "doc-number", ""))
+                kind = _ops_text(_ops_key(document_id, "kind", ""))
+                if not country or not number:
+                    continue
+                try:
+                    members.append(
+                        parse_publication_number(f"{country}{number}{kind}")
+                    )
+                except ValueError:
+                    continue
+    return members
+
+
+def _preferred_family_members(
+    pub_info: dict[str, str], members: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    """Order distinct English-authority family members for text retrieval."""
+    original = (pub_info["country"], pub_info["doc_number_full"])
+    seen: set[tuple[str, str]] = set()
+    ranked: list[tuple[int, str, dict[str, str]]] = []
+    for member in members:
+        identity = (member["country"], member["doc_number_full"])
+        if identity == original or identity in seen:
+            continue
+        seen.add(identity)
+        if member["country"] not in ENGLISH_DESCRIPTION_AUTHORITIES:
+            continue
+        ranked.append(
+            (
+                ENGLISH_DESCRIPTION_AUTHORITIES.index(member["country"]),
+                member["kind"],
+                member,
+            )
+        )
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [member for _, _, member in ranked[:MAX_FAMILY_DESCRIPTION_ATTEMPTS]]
+
+
 async def get_description_text(
     client: httpx.AsyncClient, pub_info: dict[str, str]
 ) -> tuple[str, str, str, bool]:
@@ -305,7 +468,10 @@ async def get_description_text(
 
     Publication descriptions are immutable evidence.  Cache the parsed text so
     later phrase probes and later Hermes sessions avoid another Google request
-    or a full USPTO PDF render/OCR pass.
+    or a full USPTO PDF render/OCR pass.  When OPS has no text for the exact
+    publication, an English-authority family member's OPS text is preferred
+    over any Google Patents request; the official USPTO PDF of the exact
+    publication or a US family member is the last resort.
     """
     cached = load_cached_description(pub_info)
     if cached:
@@ -314,40 +480,81 @@ async def get_description_text(
 
     publication = _publication_from_info(pub_info)
     try:
-        description_xml = await fetch_description(client, pub_info)
-        parsed = parse_description_xml(description_xml)
-        description = "\n".join(
-            para
-            for section in parsed.get("sections", [])
-            for para in section.get("paragraphs", [])
+        description = _description_text_from_xml(
+            await fetch_description(client, pub_info)
         )
         if not description:
             raise ValueError("EPO OPS returned no description text")
         source = "epo_ops_description"
-        source_url = (
-            f"{OPS_BASE_URL}/published-data/publication/{pub_info['format']}/"
-            f"{pub_info['country']}.{pub_info['doc_number']}.{pub_info['kind']}/description"
-        )
+        source_url = _ops_description_url(pub_info)
     except httpx.HTTPStatusError as error:
         if error.response.status_code != 404:
             raise
-        source = "google_patents_description_fallback"
+        failures = [f"EPO OPS has no description text for {publication}"]
+        description = ""
+        source = ""
+        source_url = ""
         try:
-            description, source_url = await fetch_google_patent_description(
-                client, pub_info
-            )
-        except Exception as google_error:
+            members = await fetch_family_members(client, pub_info)
+        except Exception as family_error:
+            members = []
+            failures.append(f"OPS family lookup failed: {family_error}")
+        candidates = _preferred_family_members(pub_info, members)
+        for member in candidates:
+            member_number = _publication_from_info(member)
             try:
-                description, source_url = await fetch_uspto_pdf_description(
+                description = _description_text_from_xml(
+                    await fetch_description(client, member)
+                )
+                if not description:
+                    raise ValueError("EPO OPS returned no description text")
+                source = "epo_ops_family_member_description"
+                source_url = _ops_description_url(member)
+                break
+            except Exception as member_error:
+                description = ""
+                failures.append(f"family member {member_number}: {member_error}")
+        if not description:
+            try:
+                description, source_url = await fetch_google_patent_description(
                     client, pub_info
                 )
-                source = "uspto_publication_pdf_ocr_fallback"
-            except Exception as uspto_error:
-                raise RuntimeError(
-                    f"Description text not available for {publication} via EPO OPS API. "
-                    f"Google Patents fallback failed: {google_error}. "
-                    f"Official USPTO PDF fallback failed: {uspto_error}."
-                ) from uspto_error
+                source = "google_patents_description_fallback"
+            except Exception as google_error:
+                failures.append(f"Google Patents fallback failed: {google_error}")
+        if not description:
+            us_candidates = [
+                candidate
+                for candidate in (pub_info, *candidates)
+                if candidate.get("country") == "US"
+            ][:2]
+            if not us_candidates:
+                failures.append(
+                    "Official USPTO PDF fallback unavailable: no US publication "
+                    "in the family"
+                )
+            for candidate in us_candidates:
+                candidate_number = _publication_from_info(candidate)
+                try:
+                    description, source_url = await fetch_uspto_pdf_description(
+                        client, candidate
+                    )
+                    source = (
+                        "uspto_publication_pdf_ocr_fallback"
+                        if candidate is pub_info
+                        else "uspto_family_member_pdf_ocr_fallback"
+                    )
+                    break
+                except Exception as uspto_error:
+                    description = ""
+                    failures.append(
+                        f"USPTO PDF fallback {candidate_number}: {uspto_error}"
+                    )
+        if not description:
+            raise RuntimeError(
+                f"Description text not available for {publication}. "
+                + " ".join(f"{failure}." for failure in failures)
+            )
 
     cache_description(pub_info, description, source, source_url)
     return description, source, source_url, False
@@ -367,16 +574,12 @@ async def search_google_patents_fulltext(
     client: httpx.AsyncClient, query: str
 ) -> dict[str, Any]:
     encoded_query = quote(_google_fulltext_query(query), safe="+")
-    response = await client.get(
+    response = await google_patents_get(
+        client,
         "https://patents.google.com/xhr/query",
         params={"url": f"q={encoded_query}", "exp": ""},
-        headers={
-            "User-Agent": "Mozilla/5.0 HermesEspacenetMCP/1.0",
-            "Accept": "application/json",
-        },
-        follow_redirects=True,
+        accept="application/json",
     )
-    response.raise_for_status()
     return response.json()
 
 

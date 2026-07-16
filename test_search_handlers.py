@@ -1,8 +1,11 @@
 import json
 import asyncio
-from pathlib import Path
 import tempfile
+import time
 import unittest
+from email.utils import formatdate
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -553,6 +556,8 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
             "An event driven circuit receives hole current from the anode."
         )
         with patch.object(server, "fetch_description", AsyncMock(side_effect=error)), patch.object(
+            server, "fetch_family_members", AsyncMock(return_value=[])
+        ), patch.object(
             server,
             "fetch_google_patent_description",
             AsyncMock(
@@ -579,6 +584,8 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
             "The event circuit receives a hole current from the photodiode anode."
         )
         with patch.object(server, "fetch_description", AsyncMock(side_effect=ops_error)), patch.object(
+            server, "fetch_family_members", AsyncMock(return_value=[])
+        ), patch.object(
             server,
             "fetch_google_patent_description",
             AsyncMock(side_effect=RuntimeError("HTTP 503")),
@@ -602,6 +609,134 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"source": "uspto_publication_pdf_ocr_fallback"', text)
         self.assertIn("photodiode anode", text)
         self.assertNotIn("#description", text)
+
+    async def test_description_prefers_english_family_member_over_google(self):
+        request = httpx.Request("GET", "https://ops.epo.org/description")
+        response = httpx.Response(404, request=request, text="not found")
+        ops_error = httpx.HTTPStatusError("not found", request=request, response=response)
+        member_xml = """
+        <description><heading>Detailed description</heading><p>
+        The event circuit receives a hole current from the photodiode anode.
+        </p></description>
+        """
+        google = AsyncMock(side_effect=AssertionError("Google Patents must not be called"))
+        with patch.object(
+            server,
+            "fetch_description",
+            AsyncMock(side_effect=[ops_error, member_xml]),
+        ), patch.object(
+            server,
+            "fetch_family_members",
+            AsyncMock(return_value=[server.parse_publication_number("WO2020112293A1")]),
+        ), patch.object(server, "fetch_google_patent_description", google):
+            text = await self.call(
+                "find_text_in_patent",
+                {"publication_number": "KR20210093332A", "search_text": "anode"},
+            )
+        self.assertIn('"source": "epo_ops_family_member_description"', text)
+        self.assertIn("WO.2020112293.A1/description", text)
+        self.assertIn("photodiode anode", text)
+        google.assert_not_awaited()
+
+    async def test_description_uses_us_family_member_pdf_when_text_routes_fail(self):
+        request = httpx.Request("GET", "https://ops.epo.org/description")
+        response = httpx.Response(404, request=request, text="not found")
+        ops_error = httpx.HTTPStatusError("not found", request=request, response=response)
+        uspto = AsyncMock(
+            return_value=(
+                "The event circuit receives a hole current from the photodiode anode.",
+                "https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10827135",
+            )
+        )
+        with patch.object(
+            server,
+            "fetch_description",
+            AsyncMock(side_effect=[ops_error, ops_error]),
+        ), patch.object(
+            server,
+            "fetch_family_members",
+            AsyncMock(return_value=[server.parse_publication_number("US10827135B2")]),
+        ), patch.object(
+            server,
+            "fetch_google_patent_description",
+            AsyncMock(side_effect=RuntimeError("HTTP 503")),
+        ), patch.object(server, "fetch_uspto_pdf_description", uspto):
+            text = await self.call(
+                "find_text_in_patent",
+                {"publication_number": "KR20210093332A", "search_text": "anode"},
+            )
+        self.assertIn('"source": "uspto_family_member_pdf_ocr_fallback"', text)
+        self.assertIn("photodiode anode", text)
+        member = uspto.await_args.args[1]
+        self.assertEqual(member["country"], "US")
+        self.assertEqual(member["doc_number_full"], "10827135")
+
+    async def test_google_patents_get_retries_throttle_with_retry_after(self):
+        request = httpx.Request("GET", "https://patents.google.com/patent/X/en")
+        throttled = httpx.Response(
+            503, request=request, headers={"Retry-After": "0"}
+        )
+        ok = httpx.Response(200, request=request, text="body")
+        client = SimpleNamespace(get=AsyncMock(side_effect=[throttled, ok]))
+        with patch.object(
+            server, "google_patents_pacer", SimpleNamespace(wait=AsyncMock())
+        ):
+            result = await server.google_patents_get(
+                client,
+                "https://patents.google.com/patent/X/en",
+                accept="text/html",
+            )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(client.get.await_count, 2)
+
+    async def test_google_patents_get_gives_up_after_bounded_retries(self):
+        request = httpx.Request("GET", "https://patents.google.com/xhr/query")
+        client = SimpleNamespace(
+            get=AsyncMock(
+                side_effect=[
+                    httpx.Response(
+                        503, request=request, headers={"Retry-After": "0"}
+                    )
+                    for _ in range(3)
+                ]
+            )
+        )
+        with patch.object(
+            server, "google_patents_pacer", SimpleNamespace(wait=AsyncMock())
+        ):
+            with self.assertRaises(httpx.HTTPStatusError):
+                await server.google_patents_get(
+                    client,
+                    "https://patents.google.com/xhr/query",
+                    accept="application/json",
+                )
+        self.assertEqual(client.get.await_count, 3)
+
+    def test_retry_after_seconds_parses_delay_and_http_date(self):
+        request = httpx.Request("GET", "https://patents.google.com/patent/X/en")
+        numeric = httpx.Response(
+            503, request=request, headers={"Retry-After": "42"}
+        )
+        self.assertEqual(server.retry_after_seconds(numeric), 42.0)
+        dated = httpx.Response(
+            503,
+            request=request,
+            headers={"Retry-After": formatdate(time.time() + 60, usegmt=True)},
+        )
+        parsed = server.retry_after_seconds(dated)
+        self.assertIsNotNone(parsed)
+        self.assertGreater(parsed, 30.0)
+        self.assertLessEqual(parsed, 61.0)
+        missing = httpx.Response(503, request=request)
+        self.assertIsNone(server.retry_after_seconds(missing))
+
+    async def test_request_pacer_spaces_consecutive_requests(self):
+        pacer = server.RequestPacer(0.05, 0.0)
+        start = time.monotonic()
+        await pacer.wait()
+        await pacer.wait()
+        await pacer.wait()
+        self.assertGreaterEqual(time.monotonic() - start, 0.10)
 
     def test_uspto_ocr_isolates_description_and_drops_claims(self):
         ocr = """
