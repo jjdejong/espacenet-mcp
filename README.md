@@ -15,7 +15,7 @@ Built for patent attorneys to quickly retrieve patent specifications, claims, an
 ## Compact, recall-safe search defaults
 
 `search_patents` returns compact publication identifiers and pagination metadata rather than the
-raw OPS response. It returns 25 identifiers by default and accepts up to 100; use `start` and
+raw OPS response. It returns 10 identifiers by default and accepts up to 100; use `start` and
 `next_start` to paginate a high-signal query. Use `raw: true` only for diagnostics, then call
 `get_patent_biblio` for shortlisted identifiers. The search endpoint covers bibliographic data and
 title/abstract text, not claims or description full text.
@@ -31,6 +31,10 @@ Ambiguous aliases such as `an=` and `applicant=` are rejected with guidance. Use
 claims or a complete specification. If OPS lacks description text it tries Google Patents, then for US
 publications the official USPTO publication PDF with local OCR (`pdftoppm` and `tesseract`).
 This is the preferred screening tool for technical disclosure in prior-art work.
+`verify_patent_shortlist` accepts the final one to three candidates and retrieves their compact
+bibliography and description evidence concurrently in one call. Parsed description text is cached under
+`~/.cache/espacenet-mcp/descriptions` (override the root with `ESPACENET_MCP_CACHE_DIR`) so later probes
+and sessions do not repeat Google fetches or USPTO PDF OCR. The tool never retrieves claims.
 OPS 404 search responses are normalized to an empty result set without replaying the XML fault body.
 
 ## Quick Start

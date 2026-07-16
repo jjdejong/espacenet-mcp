@@ -14,12 +14,14 @@ The server handles publication numbers in various formats commonly cited in offi
 """
 
 import asyncio
+import gzip
 from html import unescape
 import json
 import os
 import re
 import shutil
 import tempfile
+import time
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,7 @@ OPS_AUTH_URL = "https://ops.epo.org/3.2/auth/accesstoken"
 # Global access token cache
 access_token: str | None = None
 token_expiry: float = 0
+token_refresh_lock = asyncio.Lock()
 
 DEFAULT_SEARCH_RESULTS = 10
 MAX_SEARCH_RESULTS = 100
@@ -73,6 +76,14 @@ CITATION_TITLE_CHARS = 200
 CITATION_ABSTRACT_CHARS = 260
 USPTO_PDF_BASE_URL = "https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf"
 USPTO_OCR_CONCURRENCY = 4
+MAX_SHORTLIST_CANDIDATES = 3
+DEFAULT_SHORTLIST_MATCHES = 3
+DESCRIPTION_CACHE_VERSION = 1
+DESCRIPTION_CACHE_DIR = Path(
+    os.path.expanduser(
+        os.getenv("ESPACENET_MCP_CACHE_DIR", "~/.cache/espacenet-mcp")
+    )
+) / "descriptions"
 
 
 class GooglePatentDescriptionParser(HTMLParser):
@@ -101,6 +112,58 @@ class GooglePatentDescriptionParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._stack and self._stack[-1][1] and data.strip():
             self.parts.append(data)
+
+
+def _publication_from_info(pub_info: dict[str, str]) -> str:
+    return f"{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}"
+
+
+def _description_cache_path(pub_info: dict[str, str]) -> Path:
+    publication = re.sub(r"[^A-Z0-9]", "", _publication_from_info(pub_info).upper())
+    return DESCRIPTION_CACHE_DIR / f"{publication}.json.gz"
+
+
+def load_cached_description(
+    pub_info: dict[str, str],
+) -> tuple[str, str, str] | None:
+    """Return immutable publication description text cached by publication number."""
+    path = _description_cache_path(pub_info)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("version") != DESCRIPTION_CACHE_VERSION:
+            return None
+        description = str(payload.get("description") or "")
+        source = str(payload.get("source") or "")
+        source_url = str(payload.get("source_url") or "")
+        if description and source:
+            return description, source, source_url
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
+
+
+def cache_description(
+    pub_info: dict[str, str], description: str, source: str, source_url: str
+) -> None:
+    """Persist description text so Google fetches and USPTO OCR are paid only once."""
+    path = _description_cache_path(pub_info)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": DESCRIPTION_CACHE_VERSION,
+            "publication_number": _publication_from_info(pub_info),
+            "source": source,
+            "source_url": source_url,
+            "description": description,
+        }
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        temporary.replace(path)
+    except OSError:
+        # Caching is an optimisation and must never make evidence retrieval fail.
+        return
 
 
 async def fetch_google_patent_description(
@@ -233,6 +296,61 @@ async def fetch_uspto_pdf_description(
 
         page_text = await asyncio.gather(*(ocr_page(page) for page in pages))
     return isolate_uspto_description("\n".join(page_text)), url
+
+
+async def get_description_text(
+    client: httpx.AsyncClient, pub_info: dict[str, str]
+) -> tuple[str, str, str, bool]:
+    """Retrieve a complete description through the fastest available route.
+
+    Publication descriptions are immutable evidence.  Cache the parsed text so
+    later phrase probes and later Hermes sessions avoid another Google request
+    or a full USPTO PDF render/OCR pass.
+    """
+    cached = load_cached_description(pub_info)
+    if cached:
+        description, source, source_url = cached
+        return description, source, source_url, True
+
+    publication = _publication_from_info(pub_info)
+    try:
+        description_xml = await fetch_description(client, pub_info)
+        parsed = parse_description_xml(description_xml)
+        description = "\n".join(
+            para
+            for section in parsed.get("sections", [])
+            for para in section.get("paragraphs", [])
+        )
+        if not description:
+            raise ValueError("EPO OPS returned no description text")
+        source = "epo_ops_description"
+        source_url = (
+            f"{OPS_BASE_URL}/published-data/publication/{pub_info['format']}/"
+            f"{pub_info['country']}.{pub_info['doc_number']}.{pub_info['kind']}/description"
+        )
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != 404:
+            raise
+        source = "google_patents_description_fallback"
+        try:
+            description, source_url = await fetch_google_patent_description(
+                client, pub_info
+            )
+        except Exception as google_error:
+            try:
+                description, source_url = await fetch_uspto_pdf_description(
+                    client, pub_info
+                )
+                source = "uspto_publication_pdf_ocr_fallback"
+            except Exception as uspto_error:
+                raise RuntimeError(
+                    f"Description text not available for {publication} via EPO OPS API. "
+                    f"Google Patents fallback failed: {google_error}. "
+                    f"Official USPTO PDF fallback failed: {uspto_error}."
+                ) from uspto_error
+
+    cache_description(pub_info, description, source, source_url)
+    return description, source, source_url, False
 
 
 def _google_fulltext_query(query: str) -> str:
@@ -397,28 +515,37 @@ def parse_publication_number(pub_num: str) -> dict[str, str]:
 async def get_access_token(client: httpx.AsyncClient) -> str:
     """Get or refresh EPO OPS access token."""
     global access_token, token_expiry
-    
+
     current_time = asyncio.get_event_loop().time()
-    
+
     # Return cached token if still valid (with 60s buffer)
     if access_token and current_time < (token_expiry - 60):
         return access_token
-    
-    # Request new token
-    auth = (OPS_CONSUMER_KEY, OPS_CONSUMER_SECRET)
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {"grant_type": "client_credentials"}
-    
-    response = await client.post(OPS_AUTH_URL, auth=auth, headers=headers, data=data)
-    response.raise_for_status()
-    
-    token_data = response.json()
-    access_token = token_data["access_token"]
-    # Token typically expires in 20 minutes (1200 seconds)
-    expires_in = int(token_data.get("expires_in", 1200))
-    token_expiry = current_time + expires_in
-    
-    return access_token
+
+    # A shortlist bundle starts several OPS requests together. Only the first
+    # coroutine should refresh a cold/expired token; the others reuse it after
+    # the lock is released instead of racing the OAuth endpoint.
+    async with token_refresh_lock:
+        current_time = asyncio.get_event_loop().time()
+        if access_token and current_time < (token_expiry - 60):
+            return access_token
+
+        auth = (OPS_CONSUMER_KEY, OPS_CONSUMER_SECRET)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = {"grant_type": "client_credentials"}
+
+        response = await client.post(
+            OPS_AUTH_URL, auth=auth, headers=headers, data=data
+        )
+        response.raise_for_status()
+
+        token_data = response.json()
+        access_token = token_data["access_token"]
+        # Token typically expires in 20 minutes (1200 seconds)
+        expires_in = int(token_data.get("expires_in", 1200))
+        token_expiry = current_time + expires_in
+
+        return access_token
 
 
 async def fetch_bibliographic_data(
@@ -924,6 +1051,112 @@ def individual_term_excerpt_matches(
     return matches, counts
 
 
+def description_evidence(
+    description: str,
+    search_text: str,
+    context_chars: int,
+    max_matches: int,
+) -> dict[str, Any]:
+    """Build the same bounded evidence shape for OPS, Google, or OCR text."""
+    excerpts = literal_excerpt_matches(
+        description, search_text, context_chars, max_matches
+    )
+    term_matches: list[dict[str, str]] = []
+    term_counts: dict[str, int] = {}
+    match_mode = "exact_phrase"
+    if not excerpts and len(search_text.split()) > 1:
+        term_matches, term_counts = individual_term_excerpt_matches(
+            description, search_text, context_chars, max_matches
+        )
+        match_mode = "individual_terms"
+    matches = (
+        [{"section": "Description", "excerpt": excerpt} for excerpt in excerpts]
+        if excerpts
+        else [
+            {
+                "section": "Description",
+                "term": match["term"],
+                "excerpt": match["excerpt"],
+            }
+            for match in term_matches
+        ]
+    )
+    return {
+        "match_mode": match_mode,
+        "term_counts": term_counts,
+        "returned": len(matches),
+        "matches": matches,
+    }
+
+
+def compact_biblio_evidence(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fields needed to identify, date, and rank a final candidate."""
+    citations = []
+    for cited in parsed.get("cited_documents", []):
+        if not isinstance(cited, dict):
+            continue
+        citations.append(
+            {
+                key: cited[key]
+                for key in ("number", "category", "phase")
+                if cited.get(key)
+            }
+        )
+    return {
+        "publication": parsed.get("publication", {}),
+        "title": parsed.get("title", ""),
+        "abstract": _snippet(str(parsed.get("abstract") or ""), 700),
+        "inventors": parsed.get("inventors", []),
+        "applicants": parsed.get("applicants", []),
+        "priorities": parsed.get("priorities", []),
+        "cpc": parsed.get("classifications", {}).get("cpc", []),
+        "cited_documents": citations,
+        "family_id": parsed.get("family_id", ""),
+    }
+
+
+async def build_shortlist_candidate_evidence(
+    client: httpx.AsyncClient,
+    candidate: dict[str, Any],
+    context_chars: int,
+    max_matches: int,
+) -> dict[str, Any]:
+    publication_number = str(candidate.get("publication_number") or "").strip()
+    search_text = str(candidate.get("search_text") or "").strip()
+    if not publication_number or not search_text:
+        raise ValueError(
+            "Each shortlist candidate requires publication_number and search_text"
+        )
+    pub_info = parse_publication_number(publication_number)
+
+    async def get_biblio() -> dict[str, Any]:
+        data = await fetch_bibliographic_data(client, pub_info)
+        return canonicalize_biblio_publication(parse_biblio_json(data))
+
+    biblio, description_result = await asyncio.gather(
+        get_biblio(), get_description_text(client, pub_info)
+    )
+    description, source, source_url, cache_hit = description_result
+    evidence = description_evidence(
+        description, search_text, context_chars, max_matches
+    )
+    evidence.update(
+        {
+            "publication_number": _publication_from_info(pub_info),
+            "search_text": search_text,
+            "source": source,
+            "source_url": source_url + (
+                "#description"
+                if source == "google_patents_description_fallback"
+                else ""
+            ),
+            "description_cache_hit": cache_hit,
+            "biblio": compact_biblio_evidence(biblio),
+        }
+    )
+    return evidence
+
+
 # Create MCP server instance
 app = Server("espacenet-ops")
 
@@ -1037,6 +1270,54 @@ async def list_tools() -> list[Tool]:
                     }
                 },
                 "required": ["publication_number", "search_text"]
+            }
+        ),
+        Tool(
+            name="verify_patent_shortlist",
+            description=(
+                "Verify up to three final patent candidates in one parallel call. "
+                "Returns compact bibliography and bounded description excerpts for each "
+                "candidate, never claims. Use only after discovery has selected the final "
+                "shortlist; this reduces serial model/tool round trips."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "candidates": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_SHORTLIST_CANDIDATES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "publication_number": {
+                                    "type": "string",
+                                    "description": "A publication identifier returned by discovery or a bibliographic record"
+                                },
+                                "search_text": {
+                                    "type": "string",
+                                    "description": "Short phrase or keyword bag expressing the technical relationship to verify"
+                                }
+                            },
+                            "required": ["publication_number", "search_text"]
+                        }
+                    },
+                    "max_matches": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                        "default": DEFAULT_SHORTLIST_MATCHES,
+                        "description": "Maximum bounded description excerpts per candidate (1-5)"
+                    },
+                    "context_chars": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_EXCERPT_CONTEXT_CHARS,
+                        "default": DEFAULT_EXCERPT_CONTEXT_CHARS,
+                        "description": "Characters of context on each side of each match"
+                    }
+                },
+                "required": ["candidates"]
             }
         ),
         Tool(
@@ -1172,6 +1453,69 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     query,
                     requested_limit,
                 )
+                return [TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False),
+                )]
+
+            if name == "verify_patent_shortlist":
+                candidates = arguments.get("candidates")
+                if not isinstance(candidates, list) or not (
+                    1 <= len(candidates) <= MAX_SHORTLIST_CANDIDATES
+                ):
+                    raise ValueError(
+                        f"candidates must contain between 1 and {MAX_SHORTLIST_CANDIDATES} items"
+                    )
+                if not all(isinstance(item, dict) for item in candidates):
+                    raise ValueError("each shortlist candidate must be an object")
+                max_matches = int(
+                    arguments.get("max_matches", DEFAULT_SHORTLIST_MATCHES)
+                )
+                context_chars = int(
+                    arguments.get(
+                        "context_chars", DEFAULT_EXCERPT_CONTEXT_CHARS
+                    )
+                )
+                if not 1 <= max_matches <= 5:
+                    raise ValueError("max_matches must be between 1 and 5")
+                if not 0 <= context_chars <= MAX_EXCERPT_CONTEXT_CHARS:
+                    raise ValueError("context_chars must be between 0 and 1000")
+
+                started = time.monotonic()
+                raw_results = await asyncio.gather(
+                    *(
+                        build_shortlist_candidate_evidence(
+                            client, candidate, context_chars, max_matches
+                        )
+                        for candidate in candidates
+                    ),
+                    return_exceptions=True,
+                )
+                results: list[dict[str, Any]] = []
+                for candidate, result in zip(candidates, raw_results):
+                    if isinstance(result, Exception):
+                        results.append(
+                            {
+                                "publication_number": str(
+                                    candidate.get("publication_number") or ""
+                                ),
+                                "error": f"{type(result).__name__}: {result}",
+                            }
+                        )
+                    else:
+                        results.append(result)
+                payload = {
+                    "source": "parallel_shortlist_verification",
+                    "requested": len(candidates),
+                    "verified": sum("error" not in item for item in results),
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "candidates": results,
+                    "note": (
+                        "Final-shortlist evidence only. Rank on the returned description "
+                        "passages, keep technical relevance separate from date status, and "
+                        "do not retrieve claims."
+                    ),
+                }
                 return [TextContent(
                     type="text",
                     text=json.dumps(payload, ensure_ascii=False),
@@ -1341,140 +1685,47 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     raise ValueError("max_matches must be between 1 and 10")
                 if not 0 <= context_chars <= MAX_EXCERPT_CONTEXT_CHARS:
                     raise ValueError("context_chars must be between 0 and 1000")
-
-                # Get description
                 try:
-                    description_xml = await fetch_description(client, pub_info)
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 404:
-                        source = "google_patents_description_fallback"
-                        try:
-                            description, source_url = await fetch_google_patent_description(
-                                client, pub_info
-                            )
-                        except Exception as google_error:
-                            try:
-                                description, source_url = await fetch_uspto_pdf_description(
-                                    client, pub_info
-                                )
-                                source = "uspto_publication_pdf_ocr_fallback"
-                            except Exception as uspto_error:
-                                google_patents_url = f"https://patents.google.com/patent/{pub_info['country']}{pub_info['doc_number_full']}{pub_info['kind']}/en"
-                                return [TextContent(
-                                    type="text",
-                                    text=f"Description text not available for {pub_num} via EPO OPS API. "
-                                         f"Google Patents fallback failed: {google_error}. "
-                                         f"Official USPTO PDF fallback failed: {uspto_error}.\n"
-                                         f"Fetch {google_patents_url}#description"
-                                )]
-                        excerpts = literal_excerpt_matches(
-                            description, search_text, context_chars, max_matches
-                        )
-                        term_matches: list[dict[str, str]] = []
-                        term_counts: dict[str, int] = {}
-                        match_mode = "exact_phrase"
-                        if not excerpts and len(search_text.split()) > 1:
-                            term_matches, term_counts = individual_term_excerpt_matches(
-                                description, search_text, context_chars, max_matches
-                            )
-                            match_mode = "individual_terms"
-                        serialized_matches = (
-                            [
-                                {"section": "Description", "excerpt": excerpt}
-                                for excerpt in excerpts
-                            ]
-                            if excerpts
-                            else [
-                                {
-                                    "section": "Description",
-                                    "term": match["term"],
-                                    "excerpt": match["excerpt"],
-                                }
-                                for match in term_matches
-                            ]
-                        )
-                        return [TextContent(
-                            type="text",
-                            text=json.dumps(
-                                {
-                                    "publication_number": str(pub_num),
-                                    "search_text": str(search_text),
-                                    "source": source,
-                                    "source_url": source_url + (
-                                        "#description" if source == "google_patents_description_fallback" else ""
-                                    ),
-                                    "match_mode": match_mode,
-                                    "term_counts": term_counts,
-                                    "returned": len(serialized_matches),
-                                    "matches": serialized_matches,
-                                },
-                                ensure_ascii=False,
-                            )
-                        )]
-                    raise
-                parsed = parse_description_xml(description_xml)
-                description = "\n".join(
-                    para
-                    for section in parsed.get("sections", [])
-                    for para in section.get("paragraphs", [])
-                )
-                excerpts = literal_excerpt_matches(
-                    description, search_text, context_chars, max_matches
-                )
-                term_matches: list[dict[str, str]] = []
-                term_counts: dict[str, int] = {}
-                match_mode = "exact_phrase"
-                if not excerpts and len(search_text.split()) > 1:
-                    term_matches, term_counts = individual_term_excerpt_matches(
-                        description, search_text, context_chars, max_matches
+                    description, source, source_url, cache_hit = await get_description_text(
+                        client, pub_info
                     )
-                    match_mode = "individual_terms"
-                matches = (
-                    [{"section": "Description", "excerpt": excerpt} for excerpt in excerpts]
-                    if excerpts
-                    else [
-                        {
-                            "section": "Description",
-                            "term": match["term"],
-                            "excerpt": match["excerpt"],
-                        }
-                        for match in term_matches
-                    ]
-                )
-                
-                if not matches:
+                except RuntimeError as error:
+                    google_patents_url = (
+                        f"https://patents.google.com/patent/"
+                        f"{_publication_from_info(pub_info)}/en"
+                    )
                     return [TextContent(
                         type="text",
-                        text=json.dumps(
-                            {
-                                "publication_number": str(pub_num),
-                                "search_text": str(search_text),
-                                "returned": 0,
-                                "matches": [],
-                                "term_counts": term_counts,
-                                "note": (
-                                    "No literal description match. Try one paraphrase or "
-                                    "retrieve a bounded description window; do not retrieve claims."
-                                ),
-                            },
-                            ensure_ascii=False,
-                        )
+                        text=f"{error}\nFetch {google_patents_url}#description",
                     )]
-                
+
+                payload = {
+                    "publication_number": _publication_from_info(pub_info),
+                    "search_text": str(search_text),
+                    "source": source,
+                    "source_url": source_url + (
+                        "#description"
+                        if source == "google_patents_description_fallback"
+                        else ""
+                    ),
+                    "description_cache_hit": cache_hit,
+                }
+                payload.update(
+                    description_evidence(
+                        description,
+                        str(search_text),
+                        context_chars,
+                        max_matches,
+                    )
+                )
+                if not payload["matches"]:
+                    payload["note"] = (
+                        "No literal description match. Try one paraphrase or retrieve a "
+                        "bounded description window; do not retrieve claims."
+                    )
                 return [TextContent(
                     type="text",
-                    text=json.dumps(
-                        {
-                            "publication_number": str(pub_num),
-                            "search_text": str(search_text),
-                            "source": "epo_ops_description",
-                            "match_mode": match_mode,
-                            "term_counts": term_counts,
-                            "returned": len(matches),
-                            "matches": matches,
-                        },
-                        ensure_ascii=False,
-                    )
+                    text=json.dumps(payload, ensure_ascii=False),
                 )]
             
             elif name == "get_full_patent_data":

@@ -1,4 +1,7 @@
 import json
+import asyncio
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -8,6 +11,19 @@ import server
 
 
 class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.cache_directory = tempfile.TemporaryDirectory()
+        self.cache_patch = patch.object(
+            server,
+            "DESCRIPTION_CACHE_DIR",
+            Path(self.cache_directory.name),
+        )
+        self.cache_patch.start()
+
+    async def asyncTearDown(self):
+        self.cache_patch.stop()
+        self.cache_directory.cleanup()
+
     async def call(self, name, arguments):
         with (
             patch.object(server, "OPS_CONSUMER_KEY", "key"),
@@ -259,6 +275,109 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
             "properties"
         ]
         self.assertEqual(fulltext_properties["limit"]["maximum"], 10)
+        shortlist_properties = tools["verify_patent_shortlist"].inputSchema[
+            "properties"
+        ]
+        self.assertEqual(shortlist_properties["candidates"]["maxItems"], 3)
+        self.assertEqual(shortlist_properties["max_matches"]["maximum"], 5)
+
+    async def test_shortlist_verification_runs_three_candidates_in_parallel(self):
+        running = 0
+        maximum_running = 0
+
+        async def build(_client, candidate, _context_chars, _max_matches):
+            nonlocal running, maximum_running
+            running += 1
+            maximum_running = max(maximum_running, running)
+            await asyncio.sleep(0.02)
+            running -= 1
+            return {
+                "publication_number": candidate["publication_number"],
+                "returned": 1,
+                "matches": [{"excerpt": "description evidence"}],
+            }
+
+        candidates = [
+            {"publication_number": "EP4391573A1", "search_text": "anode cathode"},
+            {"publication_number": "US20220201236A1", "search_text": "anode hole"},
+            {"publication_number": "US10827135B2", "search_text": "frame event photodiode"},
+        ]
+        with patch.object(
+            server, "build_shortlist_candidate_evidence", side_effect=build
+        ):
+            text = await self.call(
+                "verify_patent_shortlist", {"candidates": candidates}
+            )
+        result = json.loads(text)
+        self.assertEqual(maximum_running, 3)
+        self.assertEqual(result["verified"], 3)
+        self.assertEqual(
+            [item["publication_number"] for item in result["candidates"]],
+            ["EP4391573A1", "US20220201236A1", "US10827135B2"],
+        )
+
+    async def test_concurrent_ops_requests_refresh_token_only_once(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"access_token": "shared-token", "expires_in": 1200}
+
+        client = AsyncMock()
+
+        async def post(*_args, **_kwargs):
+            await asyncio.sleep(0.02)
+            return Response()
+
+        client.post.side_effect = post
+        with (
+            patch.object(server, "access_token", None),
+            patch.object(server, "token_expiry", 0),
+        ):
+            tokens = await asyncio.gather(
+                *(server.get_access_token(client) for _ in range(6))
+            )
+
+        self.assertEqual(tokens, ["shared-token"] * 6)
+        self.assertEqual(client.post.await_count, 1)
+
+    async def test_shortlist_error_includes_exception_type(self):
+        candidates = [{
+            "publication_number": "EP4391573A1",
+            "search_text": "anode cathode",
+        }]
+        with patch.object(
+            server,
+            "build_shortlist_candidate_evidence",
+            AsyncMock(side_effect=AssertionError()),
+        ):
+            result = json.loads(await self.call(
+                "verify_patent_shortlist", {"candidates": candidates}
+            ))
+
+        self.assertEqual(result["verified"], 0)
+        self.assertEqual(result["candidates"][0]["error"], "AssertionError: ")
+
+    async def test_description_cache_avoids_second_source_fetch(self):
+        description_xml = """
+        <description><heading>Detailed description</heading><p>
+        A first path reads the cathode and an event path reads the anode.
+        </p></description>
+        """
+        fetch = AsyncMock(return_value=description_xml)
+        with patch.object(server, "fetch_description", fetch):
+            first = json.loads(await self.call(
+                "find_text_in_patent",
+                {"publication_number": "EP4391573A1", "search_text": "anode"},
+            ))
+            second = json.loads(await self.call(
+                "find_text_in_patent",
+                {"publication_number": "EP4391573A1", "search_text": "cathode"},
+            ))
+        self.assertEqual(fetch.await_count, 1)
+        self.assertFalse(first["description_cache_hit"])
+        self.assertTrue(second["description_cache_hit"])
 
     async def test_google_fulltext_search_returns_compact_patent_leads(self):
         payload = {
