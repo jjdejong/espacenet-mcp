@@ -817,6 +817,38 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("lower electrode", matches[2]["excerpt"].lower())
 
+    def test_stopwords_never_consume_bounded_excerpt_slots(self):
+        description = " ".join(
+            ["The sensor array reads image and event data each frame."] * 20
+            + [
+                "Both readout paths share one border region between the wells.",
+                "During operation the photocurrent is a hole current at the anode.",
+            ]
+        )
+
+        matches, counts = server.individual_term_excerpt_matches(
+            description,
+            "sensor image event both between photocurrent hole readout",
+            context_chars=90,
+            max_matches=3,
+            priority_text=(
+                "charge for both readout paths between circuits, photocurrent "
+                "is a hole current"
+            ),
+        )
+
+        self.assertNotIn("both", counts)
+        self.assertNotIn("between", counts)
+        anchor_terms = [match["term"] for match in matches]
+        self.assertNotIn("both", anchor_terms)
+        self.assertNotIn("between", anchor_terms)
+        self.assertIn("hole", anchor_terms)
+        self.assertIn("photocurrent", anchor_terms)
+        hole_excerpt = next(
+            match["excerpt"] for match in matches if match["term"] == "hole"
+        )
+        self.assertIn("hole current at the anode", hole_excerpt)
+
     def test_repeated_relationship_term_includes_later_operating_passage(self):
         description = (
             "The terminal is connected in the schematic. "

@@ -1258,6 +1258,23 @@ def literal_excerpt_matches(
     return excerpts
 
 
+
+# Closed-class English words carry no evidence on their own. A prose-style
+# relationship_text otherwise feeds connectives such as "both" or "between"
+# into the term bag, where their low description counts outrank substantive
+# terms and consume the bounded excerpt slots.
+EXCERPT_STOPWORDS = frozenset(
+    """
+    a an and any are all also as at be been being between both but by can
+    could did do does each either for from had has have how into is it its may might
+    more most not of on one only onto or other over shall should some such
+    than that the their them then there these they this those through thus
+    too two under upon use used uses using via was were what when where
+    which while will with within would
+    """.split()
+)
+
+
 def individual_term_excerpt_matches(
     text: str,
     query: str,
@@ -1268,7 +1285,11 @@ def individual_term_excerpt_matches(
     """Fall back from a keyword bag, prioritising its rarer description terms."""
     terms: list[str] = []
     for term in re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", query):
-        if len(term) >= 3 and term.lower() not in {item.lower() for item in terms}:
+        if (
+            len(term) >= 3
+            and term.lower() not in EXCERPT_STOPWORDS
+            and term.lower() not in {item.lower() for item in terms}
+        ):
             terms.append(term)
     counts: dict[str, int] = {}
     normalized = " ".join(text.split())
