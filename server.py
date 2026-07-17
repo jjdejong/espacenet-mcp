@@ -1298,7 +1298,7 @@ def individual_term_excerpt_matches(
         counts[term] = len(pattern.findall(normalized))
 
     # Query bags commonly begin with broad capability words (for example,
-    # "image", "sensor", or "control"). Returning matches in query order lets
+    # "system", "device", or "control"). Returning matches in query order lets
     # those words consume the bounded excerpt budget before a rare structural or
     # relational term is reached. Rarity within this candidate's description is
     # a cheap, technology-neutral proxy for discriminative evidence.
@@ -1703,7 +1703,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Technical keywords or CQL title/abstract query, e.g. 'event camera pixel'"
+                        "description": "Technical keywords or CQL title/abstract query, e.g. 'heat exchanger plate'"
                     }
                 },
                 "required": ["query"]

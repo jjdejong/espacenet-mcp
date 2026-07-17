@@ -738,6 +738,33 @@ class SearchHandlerTests(unittest.IsolatedAsyncioTestCase):
         await pacer.wait()
         self.assertGreaterEqual(time.monotonic() - start, 0.10)
 
+    def test_server_code_stays_free_of_fixture_vocabulary(self):
+        """The server must stay generic: acceptance-fixture vocabulary,
+        parties, and publication identifiers belong only in tests."""
+        import re as _re
+
+        fixture_vocabulary = _re.compile(
+            r"\bphotodiodes?\b|\belectrons?\b|\bholes?\b|\banodes?\b|"
+            r"\bcathodes?\b|\bphotocurrents?\b|\bpixels?\b|\bCDTI\b|"
+            r"\btransimpedance\b|prophesee|omnivision|finateu|bouvier|gpixel|"
+            r"event-based|frame-based|image sensor|sensing element|"
+            r"event camera|EP4391573|US20220201236|CN115023945|KR20210093332|"
+            r"US10827135",
+            _re.IGNORECASE,
+        )
+        for name in ("server.py", "xml_parser.py"):
+            with self.subTest(file=name):
+                matches = fixture_vocabulary.findall(
+                    (Path(__file__).resolve().parent / name).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    matches,
+                    [],
+                    f"fixture vocabulary in {name}: {sorted(set(matches))}",
+                )
+
     def test_uspto_ocr_isolates_description_and_drops_claims(self):
         ocr = """
         ABSTRACT
